@@ -1,0 +1,51 @@
+LR-1: MeanFlow — pixel-space one-step generative model (GPU / PyTorch)
+Track: Latent Reasoning. This track has two tasks — LR-1 (MeanFlow) and LR-2 (Coconut). Pick exactly one.
+
+Overview
+Reproduce MeanFlow for one-step image generation in pixel space, implemented in PyTorch on GPU. The official reference implementation is written for TPU (JAX / Tunix); your job is to port the idea to a clean GPU/PyTorch training loop and demonstrate that it learns.
+
+We are not asking for a SOTA result. We want to see that you understand the MeanFlow objective, can implement the average-velocity / mean-flow identity correctly, and can get a model to actually train and generate.
+
+For broader context on why latent-space search is interesting for reasoning, read the LaDiR paper and the LaDi-RL paper. Use them as conceptual background; this task does not ask you to reproduce either paper.
+
+AI usage: Fully allowed (coding agents, copilots, etc.). You must understand everything you submit.
+
+What MeanFlow is (in one paragraph)
+Flow matching learns an instantaneous velocity v(z_t, t) and generates by integrating an ODE over many steps. MeanFlow instead learns the average velocity u(z_t, r, t) between two times r < t, defined as u(z_t, r, t) = (1/(t-r)) ∫_r^t v(z_τ, τ) dτ. This satisfies the MeanFlow identity relating the average velocity to the instantaneous velocity via its total derivative (the term computed with a JVP / jvp). Training on this identity lets you sample in a single step: x_0 ≈ x_1 - u(x_1, 0, 1) (one network evaluation), instead of an N-step ODE solve.
+
+Concrete target
+Data: a 10-class ImageNet subset (e.g. Imagenette, or any fixed 10 ImageNet classes) for fast iteration. Pixel space, small resolution is fine (e.g. 32×32 or 64×64). Document your exact choice.
+Model: the smallest backbone that works is completely fine (small U-Net or small DiT/ViT). Conditioning on class label is optional; unconditional is acceptable.
+Sampler: one-step (1-NFE) generation is the headline. You may also report 2-step for context.
+Expectations (be honest about which you reached)
+Bottom line (required): overfit 3 training examples perfectly. Train on just 3 fixed images and show that one-step generation reproduces them. This proves the objective + sampler are correct end-to-end.
+Ideal (bonus): train on the 10-class subset and show that one-step samples on the training set look reasonable (recognizable structure, not noise). Full held-out quality is not required.
+Deliverables
+An HTML report (report.html, self-contained — inline or relative images) that explains:
+what you did and how MeanFlow works in your own words (the identity + JVP term);
+the problems / issues you hit and how you solved them (this is heavily weighted — numerical stability, the JVP, time sampling (r,t), loss not going down, etc.);
+generated images: the 3-example overfit result, and (if reached) training-set samples;
+your loss curve(s).
+The codebase (training + sampling, runnable, with a short README.md on how to reproduce).
+Submit a GitHub repo URL containing the code and README. If report.html is too large to upload to GitHub, host it separately and paste the report URL in the HTML report link field on the submission form.
+
+<!-- UG_ONLY_START -->
+Hints
+Start with the overfit-3 test before anything else. It is the fastest signal that your loss, your (r, t) sampling, and your one-step sampler agree. If 3 images won't overfit, scaling up won't help.
+The mean-flow identity needs a directional derivative of u w.r.t. (z_t, t) along the flow. In PyTorch use torch.func.jvp (functorch) — this is the single trickiest part of the port from JAX's jax.jvp. Get the tangent vector right: it pairs (v, 0..., 1) for inputs (z_t, r, t).
+Use a stop-gradient on the JVP target term (matching the paper) — gradients flow only through the u prediction, not through the target.
+Sample r and t with r ≤ t; include a fraction of r == t (reduces to plain flow matching) to stabilize early training. Document your sampling distribution.
+Keep the backbone tiny and the batch fixed while debugging. Log the loss every step.
+Pixel space at low resolution avoids needing a VAE — keep it simple.
+<!-- UG_ONLY_END -->
+Resources
+LaDiR paper: LaDiR: Latent Diffusion Enhances LLMs for Text Reasoning.
+LaDi-RL paper: Beyond Mode Elicitation: Diversity-Preserving Reinforcement Learning via Latent Diffusion Reasoner.
+Paper: Mean Flows for One-step Generative Modeling (Geng et al., 2025) — read the identity and the training algorithm carefully; the loss and the JVP target are the whole task.
+Official reference: the TPU / JAX (Tunix) implementation — use it to check shapes, the tangent construction, and the time-sampling scheme, then re-express in PyTorch.
+Data: Imagenette (fastai/imagenette) or any fixed 10 ImageNet classes.
+JVP in PyTorch: torch.func.jvp / torch.autograd.functional.jvp.
+What we evaluate
+Correctness of the MeanFlow objective and the one-step sampler (does the overfit actually work?).
+Quality of your explanation of problems faced and how you solved them — we care about your debugging and reasoning, not just the final image.
+Code clarity and reproducibility.

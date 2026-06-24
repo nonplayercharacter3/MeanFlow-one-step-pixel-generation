@@ -1,0 +1,9 @@
+__pycache__/
+*.py[cod]
+.venv/
+outputs/
+.DS_Store
+
+# Local datasets are too large for the GitHub repo.
+data/imagenette2-160/
+data/imagenette2-160.tgz
