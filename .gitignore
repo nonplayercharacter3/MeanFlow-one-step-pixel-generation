@@ -3,6 +3,7 @@ __pycache__/
 .venv/
 outputs/
 .DS_Store
+Assignment.md
 
 # Local datasets are too large for the GitHub repo.
 data/imagenette2-160/

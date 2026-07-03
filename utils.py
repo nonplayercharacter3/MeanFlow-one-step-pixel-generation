@@ -35,15 +35,15 @@ def save_image(tensor: torch.Tensor, path: str) -> None:
     Image.fromarray(image).save(path)
 
 
-def append_loss_csv(path: str, step: int, loss: float) -> None:
+def append_loss_csv(path: str, step: int, loss: float, sample_mse: float) -> None:
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     needs_header = not path.exists()
     with path.open("a", newline="") as handle:
         writer = csv.writer(handle)
         if needs_header:
-            writer.writerow(["step", "loss"])
-        writer.writerow([step, loss])
+            writer.writerow(["step", "loss", "sample_mse"])
+        writer.writerow([step, loss, sample_mse])
 
 
 def all_finite(*tensors: torch.Tensor) -> bool:
