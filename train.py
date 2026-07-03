@@ -138,6 +138,7 @@ def main() -> None:
     run_sanity_checks(model, optimizer, clean_image)
 
     fixed_eval_noise = torch.randn(1, 3, args.image_size, args.image_size, device=device)
+    torch.save(fixed_eval_noise.detach().cpu(), output_dir / "fixed_eval_noise.pt")
     save_image(clean_image[:1], str(output_dir / "clean.png"))
     save_image(fixed_eval_noise, str(output_dir / "fixed_noise.png"))
 
@@ -162,6 +163,7 @@ def main() -> None:
         if sample_mse < best_sample_mse:
             best_sample_mse = sample_mse
             save_checkpoint(output_dir / "checkpoint_best.pt", step, model, optimizer, args, sample_mse)
+            save_image(sample, str(output_dir / "sample_best.png"))
 
         if step == 1 or step % 50 == 0:
             finite = all_finite(
