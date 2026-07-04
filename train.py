@@ -143,7 +143,9 @@ def parse_args():
         "--lr-patience",
         type=int,
         default=200,
-        help="Steps with no sample_mse improvement before --adaptive-lr cuts the LR.",
+        help="Training steps with no sample_mse improvement before --adaptive-lr cuts the LR "
+        "(internally converted to eval-call units, since sample_mse is only measured every "
+        "--eval-every steps).",
     )
     parser.add_argument(
         "--lr-factor",
@@ -267,8 +269,16 @@ def main() -> None:
 
     plateau_scheduler = None
     if args.adaptive_lr:
+        # plateau_scheduler.step() only runs on eval steps (~every --eval-every training
+        # steps), and ReduceLROnPlateau counts patience in step() calls. Convert the
+        # user-facing training-step patience into eval-call units here; previously the raw
+        # value was passed through, making the effective patience --eval-every times longer
+        # than documented (e.g. 300 -> ~3000 training steps), so the LR never dropped.
         plateau_scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-            optimizer, mode="min", factor=args.lr_factor, patience=args.lr_patience
+            optimizer,
+            mode="min",
+            factor=args.lr_factor,
+            patience=max(1, args.lr_patience // args.eval_every),
         )
         scheduler = None
     elif args.no_lr_decay:
