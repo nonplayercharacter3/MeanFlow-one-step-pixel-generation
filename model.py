@@ -2,14 +2,31 @@ import torch
 from torch import nn
 
 
+def group_norm_groups(channels: int, max_groups: int = 32) -> int:
+    """Largest group count <= max_groups that evenly divides channels."""
+    for groups in range(min(max_groups, channels), 0, -1):
+        if channels % groups == 0:
+            return groups
+    return 1
+
+
 class ResidualConvBlock(nn.Module):
-    """Two convolution layers with a skip connection for easier optimization."""
+    """Two GroupNorm+conv layers with a skip connection for easier optimization.
+
+    No normalization anywhere in the network was letting activation magnitudes drift
+    unpredictably across the 5 different resolution levels, which is exactly the kind of
+    instability this project kept fighting. GroupNorm before each conv is standard practice
+    in diffusion U-Nets specifically to stabilize this.
+    """
 
     def __init__(self, channels: int):
         super().__init__()
+        groups = group_norm_groups(channels)
         self.net = nn.Sequential(
+            nn.GroupNorm(groups, channels),
             nn.SiLU(),
             nn.Conv2d(channels, channels, kernel_size=3, padding=1),
+            nn.GroupNorm(groups, channels),
             nn.SiLU(),
             nn.Conv2d(channels, channels, kernel_size=3, padding=1),
         )
@@ -96,6 +113,7 @@ class TinyTimeConditionedCNN(nn.Module):
         self.up_blocks_1 = nn.ModuleList([ResidualConvBlock(channels_1) for _ in range(num_blocks)])
 
         self.output_conv = nn.Sequential(
+            nn.GroupNorm(group_norm_groups(channels_1), channels_1),
             nn.SiLU(),
             nn.Conv2d(channels_1, image_channels, kernel_size=3, padding=1),
         )
