@@ -127,6 +127,13 @@ def parse_args():
         help="Use a constant --lr instead of cosine decay. Useful when warm-starting from --resume-from.",
     )
     parser.add_argument(
+        "--lr-decay-steps",
+        type=int,
+        default=None,
+        help="Cosine decay reaches its floor after this many steps. Defaults to --steps. Set higher than "
+        "--steps to decay more slowly (training ends before the schedule bottoms out).",
+    )
+    parser.add_argument(
         "--ema-decay",
         type=float,
         default=0.999,
@@ -198,7 +205,9 @@ def main() -> None:
     scheduler = (
         None
         if args.no_lr_decay
-        else torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.steps, eta_min=args.lr * 0.01)
+        else torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer, T_max=args.lr_decay_steps or args.steps, eta_min=args.lr * 0.01
+        )
     )
 
     run_sanity_checks(model, optimizer, clean_image)
