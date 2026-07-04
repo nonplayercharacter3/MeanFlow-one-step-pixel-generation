@@ -135,6 +135,7 @@ def main() -> None:
     ).to(device=device, dtype=torch.float32)
     print(f"Model trainable parameters: {count_trainable_parameters(model):,}")
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.steps, eta_min=args.lr * 0.01)
 
     run_sanity_checks(model, optimizer, clean_image)
 
@@ -153,6 +154,7 @@ def main() -> None:
         optimizer.zero_grad(set_to_none=True)
         result.loss.backward()
         optimizer.step()
+        scheduler.step()
 
         with torch.no_grad():
             sample = one_step_sample(model, fixed_eval_noise)
@@ -178,6 +180,7 @@ def main() -> None:
             )
             print(
                 f"step={step:04d}",
+                f"lr={scheduler.get_last_lr()[0]:.6f}",
                 f"loss={loss_value:.6f}",
                 f"sample_mse={sample_mse:.6f}",
                 f"|u|={result.mean_velocity.abs().mean().item():.4f}",
