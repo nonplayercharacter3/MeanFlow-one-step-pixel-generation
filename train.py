@@ -29,8 +29,8 @@ def analytical_jvp_check(device: torch.device) -> None:
     assert torch.allclose(tangent, expected_tangent), f"JVP check failed: {tangent}"
 
 
-def first_parameter_snapshot(model: torch.nn.Module) -> torch.Tensor:
-    return next(parameter for parameter in model.parameters() if parameter.requires_grad).detach().clone()
+def parameter_snapshot(model: torch.nn.Module) -> list[torch.Tensor]:
+    return [parameter.detach().clone() for parameter in model.parameters() if parameter.requires_grad]
 
 
 def save_checkpoint(path: Path, step: int, model, optimizer, args, sample_mse: float, ema: "EMA | None" = None) -> None:
@@ -66,7 +66,7 @@ def run_sanity_checks(model, optimizer, clean_image: torch.Tensor) -> None:
     assert torch.allclose(result.target, batch.velocity, atol=1e-5)
     assert not result.target.requires_grad
 
-    before = first_parameter_snapshot(model)
+    before = parameter_snapshot(model)
     optimizer.zero_grad(set_to_none=True)
     result.loss.backward()
 
@@ -80,8 +80,12 @@ def run_sanity_checks(model, optimizer, clean_image: torch.Tensor) -> None:
     assert finite_nonzero_gradient, "no finite nonzero gradient found"
 
     optimizer.step()
-    after = first_parameter_snapshot(model)
-    assert not torch.allclose(before, after), "optimizer step did not change the first parameter"
+    after = parameter_snapshot(model)
+    # Not every parameter moves on step 1: the zero-initialized FiLM projections block the
+    # gradient to the time MLP at init, so check the model as a whole rather than any one tensor.
+    assert any(
+        not torch.allclose(b, a) for b, a in zip(before, after)
+    ), "optimizer step did not change any parameter"
 
     print("Sanity checks passed.")
 
@@ -111,6 +115,14 @@ def parse_args():
     parser.add_argument("--output-dir", type=str, default="outputs")
     parser.add_argument("--equal-time-probability", type=float, default=0.1)
     parser.add_argument("--endpoint-probability", type=float, default=0.25)
+    parser.add_argument(
+        "--time-sampling",
+        type=str,
+        choices=["uniform", "logit_normal"],
+        default="uniform",
+        help="Distribution for r, t before the equal-time/endpoint overrides. 'logit_normal' is the "
+        "MeanFlow paper's sigmoid(N(-0.4, 1.0)), concentrating training at mid-range noise levels.",
+    )
     parser.add_argument("--hidden-channels", type=int, default=128)
     parser.add_argument("--time-dim", type=int, default=64)
     parser.add_argument("--num-blocks", type=int, default=4)
@@ -304,7 +316,9 @@ def main() -> None:
     per_image_weight = torch.ones(num_images, device=device)
 
     for step in range(1, args.steps + 1):
-        batch = make_meanflow_batch(clean_image, args.equal_time_probability, args.endpoint_probability)
+        batch = make_meanflow_batch(
+            clean_image, args.equal_time_probability, args.endpoint_probability, args.time_sampling
+        )
         sample_weight = per_image_weight[image_indices] if args.reweight_images else None
         result = meanflow_loss(model, batch, sample_weight, args.loss_weight_power, args.loss_weight_c)
 
