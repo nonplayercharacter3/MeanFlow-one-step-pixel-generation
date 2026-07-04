@@ -6,8 +6,6 @@ from torch.func import jvp
 
 @dataclass
 class MeanFlowBatch:
-    clean_image: torch.Tensor
-    noise: torch.Tensor
     z_t: torch.Tensor
     velocity: torch.Tensor
     r: torch.Tensor
@@ -83,14 +81,7 @@ def make_meanflow_batch(
     z_t = (1.0 - t_image) * clean_image + t_image * noise
     velocity = noise - clean_image
 
-    return MeanFlowBatch(
-        clean_image=clean_image,
-        noise=noise,
-        z_t=z_t,
-        velocity=velocity,
-        r=r,
-        t=t,
-    )
+    return MeanFlowBatch(z_t=z_t, velocity=velocity, r=r, t=t)
 
 
 def meanflow_loss(

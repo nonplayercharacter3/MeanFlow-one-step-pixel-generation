@@ -4,7 +4,7 @@ from pathlib import Path
 import torch
 from torch.func import jvp
 
-from meanflow import MeanFlowBatch, make_meanflow_batch, meanflow_loss, one_step_sample
+from meanflow import make_meanflow_batch, meanflow_loss, one_step_sample
 from model import TinyTimeConditionedCNN
 from utils import EMA, all_finite, append_loss_csv, load_image, save_image, save_image_grid, save_loss_curve, set_seed
 
@@ -52,7 +52,6 @@ def count_trainable_parameters(model: torch.nn.Module) -> int:
 
 def run_sanity_checks(model, optimizer, clean_image: torch.Tensor) -> None:
     model.train()
-    batch_size = clean_image.shape[0]
     batch = make_meanflow_batch(clean_image, equal_time_probability=1.0, endpoint_probability=0.0)
     result = meanflow_loss(model, batch)
 
@@ -316,7 +315,6 @@ def main() -> None:
     # reproduction across all of them.
     num_eval_noises = max(args.num_eval_noises, num_images)
     fixed_eval_noise = torch.randn(num_eval_noises, 3, args.image_size, args.image_size, device=device)
-    torch.save(fixed_eval_noise.detach().cpu(), output_dir / "fixed_eval_noise.pt")
     for index in range(num_images):
         save_image(base_images[index : index + 1], str(output_dir / f"clean_{index}.png"))
     save_image_grid(base_images, str(output_dir / "clean_grid.png"))
