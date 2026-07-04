@@ -99,6 +99,12 @@ def parse_args():
     parser.add_argument("--batch-size", type=int, default=16)
     parser.add_argument("--image-size", type=int, default=32)
     parser.add_argument("--lr", type=float, default=1e-3)
+    parser.add_argument(
+        "--weight-decay",
+        type=float,
+        default=0.0,
+        help="AdamW weight decay. Default 0 since the goal here is to overfit exactly, not regularize.",
+    )
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--sample-every", type=int, default=200)
     parser.add_argument("--checkpoint-every", type=int, default=500)
@@ -162,7 +168,7 @@ def main() -> None:
         num_blocks=args.num_blocks,
     ).to(device=device, dtype=torch.float32)
     print(f"Model trainable parameters: {count_trainable_parameters(model):,}")
-    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
 
     if args.resume_from:
         checkpoint = torch.load(args.resume_from, map_location=device)
