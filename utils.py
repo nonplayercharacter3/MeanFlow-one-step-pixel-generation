@@ -65,6 +65,27 @@ def all_finite(*tensors: torch.Tensor) -> bool:
     return all(torch.isfinite(tensor).all().item() for tensor in tensors)
 
 
+class EMA:
+    """Exponential moving average of a model's parameters, used only for sampling."""
+
+    def __init__(self, model: torch.nn.Module, decay: float):
+        self.decay = decay
+        self.shadow = {name: param.detach().clone() for name, param in model.state_dict().items()}
+
+    def update(self, model: torch.nn.Module) -> None:
+        for name, param in model.state_dict().items():
+            self.shadow[name].mul_(self.decay).add_(param.detach(), alpha=1.0 - self.decay)
+
+    def copy_to(self, model: torch.nn.Module) -> None:
+        model.load_state_dict(self.shadow)
+
+    def state_dict(self):
+        return self.shadow
+
+    def load_state_dict(self, state_dict) -> None:
+        self.shadow = {name: value.clone() for name, value in state_dict.items()}
+
+
 def save_loss_curve(csv_path: str, out_path: str) -> None:
     """Read a loss_history.csv and save a loss/sample_mse-vs-step plot."""
     import matplotlib

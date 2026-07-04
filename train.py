@@ -7,7 +7,7 @@ from torch.func import jvp
 
 from meanflow import MeanFlowBatch, make_meanflow_batch, meanflow_loss, one_step_sample
 from model import TinyTimeConditionedCNN
-from utils import all_finite, append_loss_csv, load_image, save_image, save_image_grid, save_loss_curve, set_seed
+from utils import EMA, all_finite, append_loss_csv, load_image, save_image, save_image_grid, save_loss_curve, set_seed
 
 
 def analytical_jvp_check(device: torch.device) -> None:
@@ -33,11 +33,12 @@ def first_parameter_snapshot(model: torch.nn.Module) -> torch.Tensor:
     return next(parameter for parameter in model.parameters() if parameter.requires_grad).detach().clone()
 
 
-def save_checkpoint(path: Path, step: int, model, optimizer, args, sample_mse: float) -> None:
+def save_checkpoint(path: Path, step: int, model, optimizer, args, sample_mse: float, ema: "EMA | None" = None) -> None:
     torch.save(
         {
             "step": step,
             "model": model.state_dict(),
+            "ema": ema.state_dict() if ema is not None else None,
             "optimizer": optimizer.state_dict(),
             "args": vars(args),
             "sample_mse": sample_mse,
@@ -119,6 +120,12 @@ def parse_args():
         action="store_true",
         help="Use a constant --lr instead of cosine decay. Useful when warm-starting from --resume-from.",
     )
+    parser.add_argument(
+        "--ema-decay",
+        type=float,
+        default=0.999,
+        help="Decay for an exponential moving average of weights, used for sampling. Set to 0 to disable.",
+    )
     return parser.parse_args()
 
 
@@ -167,6 +174,21 @@ def main() -> None:
         for param_group in optimizer.param_groups:
             param_group["lr"] = args.lr
 
+    ema = EMA(model, args.ema_decay) if args.ema_decay > 0 else None
+    if ema is not None and args.resume_from and checkpoint.get("ema") is not None:
+        ema.load_state_dict(checkpoint["ema"])
+        print("Resumed EMA weights too.")
+
+    eval_model = None
+    if ema is not None:
+        eval_model = TinyTimeConditionedCNN(
+            hidden_channels=args.hidden_channels,
+            time_dim=args.time_dim,
+            num_blocks=args.num_blocks,
+        ).to(device=device, dtype=torch.float32)
+        for parameter in eval_model.parameters():
+            parameter.requires_grad_(False)
+
     scheduler = (
         None
         if args.no_lr_decay
@@ -196,9 +218,15 @@ def main() -> None:
         optimizer.step()
         if scheduler is not None:
             scheduler.step()
+        if ema is not None:
+            ema.update(model)
 
         with torch.no_grad():
-            sample = one_step_sample(model, fixed_eval_noise)
+            if ema is not None:
+                ema.copy_to(eval_model)
+                sample = one_step_sample(eval_model, fixed_eval_noise)
+            else:
+                sample = one_step_sample(model, fixed_eval_noise)
             sample_mse = F.mse_loss(sample, base_images).item()
 
         loss_value = result.loss.item()
@@ -206,7 +234,7 @@ def main() -> None:
 
         if sample_mse < best_sample_mse:
             best_sample_mse = sample_mse
-            save_checkpoint(output_dir / "checkpoint_best.pt", step, model, optimizer, args, sample_mse)
+            save_checkpoint(output_dir / "checkpoint_best.pt", step, model, optimizer, args, sample_mse, ema)
             for index in range(num_images):
                 save_image(sample[index : index + 1], str(output_dir / f"sample_best_{index}.png"))
             save_image_grid(sample, str(output_dir / "sample_best_grid.png"))
@@ -236,7 +264,7 @@ def main() -> None:
             save_image_grid(sample, str(output_dir / f"sample_step_{step:04d}.png"))
 
         if step % args.checkpoint_every == 0 or step == args.steps:
-            save_checkpoint(output_dir / "checkpoint.pt", step, model, optimizer, args, sample_mse)
+            save_checkpoint(output_dir / "checkpoint.pt", step, model, optimizer, args, sample_mse, ema)
 
     save_loss_curve(str(loss_csv), str(output_dir / "loss_curve.png"))
 
