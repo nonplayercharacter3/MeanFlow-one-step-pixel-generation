@@ -27,6 +27,9 @@ def sample_times(
     device: torch.device,
     equal_time_probability: float = 0.1,
     endpoint_probability: float = 0.25,
+    time_sampling: str = "uniform",
+    logit_normal_mean: float = -0.4,
+    logit_normal_std: float = 1.0,
 ):
     """Sample scalar times with 0 <= r <= t <= 1.
 
@@ -35,9 +38,22 @@ def sample_times(
     is exactly what one-step sampling evaluates at inference, but independent
     uniform r, t give it zero density (most sampled gaps t-r cluster near 0),
     so without this the model rarely practices the case it is actually judged on.
+
+    time_sampling="logit_normal" draws each time as sigmoid(N(mean, std)) instead of
+    uniform -- the MeanFlow paper's scheme (mu=-0.4, sigma=1.0), which concentrates
+    training at mid-range noise levels where the velocity field is hardest, instead of
+    spending a third of the batch on the nearly-trivial regions near t=0 and t=1.
     """
-    r = torch.rand(batch_size, device=device)
-    t = torch.rand(batch_size, device=device)
+    if time_sampling == "logit_normal":
+        samples = torch.sigmoid(
+            torch.randn(2, batch_size, device=device) * logit_normal_std + logit_normal_mean
+        )
+        r, t = samples[0], samples[1]
+    elif time_sampling == "uniform":
+        r = torch.rand(batch_size, device=device)
+        t = torch.rand(batch_size, device=device)
+    else:
+        raise ValueError(f"unknown time_sampling: {time_sampling!r}")
     r, t = torch.minimum(r, t), torch.maximum(r, t)
 
     equal_mask = torch.rand(batch_size, device=device) < equal_time_probability
@@ -54,11 +70,14 @@ def make_meanflow_batch(
     clean_image: torch.Tensor,
     equal_time_probability: float = 0.1,
     endpoint_probability: float = 0.25,
+    time_sampling: str = "uniform",
 ) -> MeanFlowBatch:
     """Create one training batch from the fixed clean image and fresh Gaussian noise."""
     batch_size = clean_image.shape[0]
     noise = torch.randn_like(clean_image)
-    r, t = sample_times(batch_size, clean_image.device, equal_time_probability, endpoint_probability)
+    r, t = sample_times(
+        batch_size, clean_image.device, equal_time_probability, endpoint_probability, time_sampling
+    )
 
     t_image = t[:, :, None, None]
     z_t = (1.0 - t_image) * clean_image + t_image * noise
