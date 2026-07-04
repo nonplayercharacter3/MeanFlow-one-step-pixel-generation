@@ -157,6 +157,14 @@ def parse_args():
         default=0.999,
         help="Decay for an exponential moving average of weights, used for sampling. Set to 0 to disable.",
     )
+    parser.add_argument(
+        "--eval-every",
+        type=int,
+        default=10,
+        help="Compute the one-step sample / sample_mse only every N steps (still trains every step). "
+        "The sample forward pass + EMA copy is a full extra model evaluation on top of the JVP training "
+        "step, so skipping it on most steps meaningfully speeds up training.",
+    )
     return parser.parse_args()
 
 
@@ -259,53 +267,64 @@ def main() -> None:
         if ema is not None:
             ema.update(model)
 
-        with torch.no_grad():
-            if ema is not None:
-                ema.copy_to(eval_model)
-                sample = one_step_sample(eval_model, fixed_eval_noise)
-            else:
-                sample = one_step_sample(model, fixed_eval_noise)
-            sample_mse = F.mse_loss(sample, base_images).item()
-
-        if plateau_scheduler is not None:
-            plateau_scheduler.step(sample_mse)
-
         loss_value = result.loss.item()
-        append_loss_csv(str(loss_csv), step, loss_value, sample_mse)
 
-        if sample_mse < best_sample_mse:
-            best_sample_mse = sample_mse
-            save_checkpoint(output_dir / "checkpoint_best.pt", step, model, optimizer, args, sample_mse, ema)
-            for index in range(num_images):
-                save_image(sample[index : index + 1], str(output_dir / f"sample_best_{index}.png"))
-            save_image_grid(sample, str(output_dir / "sample_best_grid.png"))
+        needs_eval = (
+            step == 1
+            or step % args.eval_every == 0
+            or step % 50 == 0
+            or step % args.sample_every == 0
+            or step % args.checkpoint_every == 0
+            or step == args.steps
+        )
 
-        if step == 1 or step % 50 == 0:
-            finite = all_finite(
-                batch.z_t,
-                batch.velocity,
-                result.mean_velocity,
-                result.jvp_term,
-                result.target,
-                result.loss,
-                sample,
-            )
-            current_lr = optimizer.param_groups[0]["lr"]
-            print(
-                f"step={step:04d}",
-                f"lr={current_lr:.6f}",
-                f"loss={loss_value:.6f}",
-                f"sample_mse={sample_mse:.6f}",
-                f"|u|={result.mean_velocity.abs().mean().item():.4f}",
-                f"|jvp|={result.jvp_term.abs().mean().item():.4f}",
-                f"finite={finite}",
-            )
+        if needs_eval:
+            with torch.no_grad():
+                if ema is not None:
+                    ema.copy_to(eval_model)
+                    sample = one_step_sample(eval_model, fixed_eval_noise)
+                else:
+                    sample = one_step_sample(model, fixed_eval_noise)
+                sample_mse = F.mse_loss(sample, base_images).item()
 
-        if step == 1 or step % args.sample_every == 0:
-            save_image_grid(sample, str(output_dir / f"sample_step_{step:04d}.png"))
+            if plateau_scheduler is not None:
+                plateau_scheduler.step(sample_mse)
 
-        if step % args.checkpoint_every == 0 or step == args.steps:
-            save_checkpoint(output_dir / "checkpoint.pt", step, model, optimizer, args, sample_mse, ema)
+            append_loss_csv(str(loss_csv), step, loss_value, sample_mse)
+
+            if sample_mse < best_sample_mse:
+                best_sample_mse = sample_mse
+                save_checkpoint(output_dir / "checkpoint_best.pt", step, model, optimizer, args, sample_mse, ema)
+                for index in range(num_images):
+                    save_image(sample[index : index + 1], str(output_dir / f"sample_best_{index}.png"))
+                save_image_grid(sample, str(output_dir / "sample_best_grid.png"))
+
+            if step == 1 or step % 50 == 0:
+                finite = all_finite(
+                    batch.z_t,
+                    batch.velocity,
+                    result.mean_velocity,
+                    result.jvp_term,
+                    result.target,
+                    result.loss,
+                    sample,
+                )
+                current_lr = optimizer.param_groups[0]["lr"]
+                print(
+                    f"step={step:04d}",
+                    f"lr={current_lr:.6f}",
+                    f"loss={loss_value:.6f}",
+                    f"sample_mse={sample_mse:.6f}",
+                    f"|u|={result.mean_velocity.abs().mean().item():.4f}",
+                    f"|jvp|={result.jvp_term.abs().mean().item():.4f}",
+                    f"finite={finite}",
+                )
+
+            if step == 1 or step % args.sample_every == 0:
+                save_image_grid(sample, str(output_dir / f"sample_step_{step:04d}.png"))
+
+            if step % args.checkpoint_every == 0 or step == args.steps:
+                save_checkpoint(output_dir / "checkpoint.pt", step, model, optimizer, args, sample_mse, ema)
 
     save_loss_curve(str(loss_csv), str(output_dir / "loss_curve.png"))
 
