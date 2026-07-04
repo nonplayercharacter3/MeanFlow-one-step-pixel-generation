@@ -53,7 +53,7 @@ def count_trainable_parameters(model: torch.nn.Module) -> int:
 def run_sanity_checks(model, optimizer, clean_image: torch.Tensor) -> None:
     model.train()
     batch_size = clean_image.shape[0]
-    batch = make_meanflow_batch(clean_image, equal_time_probability=1.0)
+    batch = make_meanflow_batch(clean_image, equal_time_probability=1.0, endpoint_probability=0.0)
     result = meanflow_loss(model, batch)
 
     assert result.mean_velocity.shape == clean_image.shape
@@ -97,6 +97,7 @@ def parse_args():
     parser.add_argument("--checkpoint-every", type=int, default=500)
     parser.add_argument("--output-dir", type=str, default="outputs")
     parser.add_argument("--equal-time-probability", type=float, default=0.1)
+    parser.add_argument("--endpoint-probability", type=float, default=0.25)
     parser.add_argument("--hidden-channels", type=int, default=128)
     parser.add_argument("--time-dim", type=int, default=64)
     parser.add_argument("--num-blocks", type=int, default=4)
@@ -146,7 +147,7 @@ def main() -> None:
     best_sample_mse = float("inf")
 
     for step in range(1, args.steps + 1):
-        batch = make_meanflow_batch(clean_image, args.equal_time_probability)
+        batch = make_meanflow_batch(clean_image, args.equal_time_probability, args.endpoint_probability)
         result = meanflow_loss(model, batch)
 
         optimizer.zero_grad(set_to_none=True)
