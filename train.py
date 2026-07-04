@@ -205,11 +205,21 @@ def main() -> None:
 
     if args.resume_from:
         checkpoint = torch.load(args.resume_from, map_location=device)
-        model.load_state_dict(checkpoint["model"])
-        print(
-            f"Resumed model weights from {args.resume_from} "
-            f"(saved at step {checkpoint['step']}, sample_mse={checkpoint['sample_mse']:.6f})"
-        )
+        if checkpoint.get("ema") is not None:
+            # The saved "model" is the raw weights at that instant, which can be noisier than
+            # the EMA-smoothed weights that actually produced the checkpointed sample_mse.
+            # Continue training from the smoothed point, not the noisy one.
+            model.load_state_dict(checkpoint["ema"])
+            print(
+                f"Resumed model weights from EMA in {args.resume_from} "
+                f"(saved at step {checkpoint['step']}, sample_mse={checkpoint['sample_mse']:.6f})"
+            )
+        else:
+            model.load_state_dict(checkpoint["model"])
+            print(
+                f"Resumed model weights from {args.resume_from} "
+                f"(saved at step {checkpoint['step']}, sample_mse={checkpoint['sample_mse']:.6f})"
+            )
         for param_group in optimizer.param_groups:
             param_group["lr"] = args.lr
 
