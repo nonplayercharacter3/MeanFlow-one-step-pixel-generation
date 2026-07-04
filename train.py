@@ -301,11 +301,12 @@ def main() -> None:
                 else:
                     sample = one_step_sample(model, fixed_eval_noise)
                 sample_mse = F.mse_loss(sample, base_images).item()
+                per_image_mse = F.mse_loss(sample, base_images, reduction="none").mean(dim=(1, 2, 3)).tolist()
 
             if plateau_scheduler is not None:
                 plateau_scheduler.step(sample_mse)
 
-            append_loss_csv(str(loss_csv), step, loss_value, sample_mse)
+            append_loss_csv(str(loss_csv), step, loss_value, sample_mse, per_image_mse)
 
             if sample_mse < best_sample_mse:
                 best_sample_mse = sample_mse
@@ -325,11 +326,13 @@ def main() -> None:
                     sample,
                 )
                 current_lr = optimizer.param_groups[0]["lr"]
+                per_image_str = " ".join(f"img{i}={mse:.4f}" for i, mse in enumerate(per_image_mse))
                 print(
                     f"step={step:04d}",
                     f"lr={current_lr:.6f}",
                     f"loss={loss_value:.6f}",
                     f"sample_mse={sample_mse:.6f}",
+                    f"[{per_image_str}]",
                     f"|u|={result.mean_velocity.abs().mean().item():.4f}",
                     f"|jvp|={result.jvp_term.abs().mean().item():.4f}",
                     f"finite={finite}",

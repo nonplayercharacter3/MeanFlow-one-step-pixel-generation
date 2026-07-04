@@ -50,15 +50,17 @@ def save_image_grid(tensor: torch.Tensor, path: str) -> None:
     grid.save(path)
 
 
-def append_loss_csv(path: str, step: int, loss: float, sample_mse: float) -> None:
+def append_loss_csv(path: str, step: int, loss: float, sample_mse: float, per_image_mse=None) -> None:
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     needs_header = not path.exists()
+    per_image_mse = per_image_mse or []
     with path.open("a", newline="") as handle:
         writer = csv.writer(handle)
         if needs_header:
-            writer.writerow(["step", "loss", "sample_mse"])
-        writer.writerow([step, loss, sample_mse])
+            header = ["step", "loss", "sample_mse"] + [f"sample_mse_{i}" for i in range(len(per_image_mse))]
+            writer.writerow(header)
+        writer.writerow([step, loss, sample_mse, *per_image_mse])
 
 
 def all_finite(*tensors: torch.Tensor) -> bool:
@@ -94,16 +96,23 @@ def save_loss_curve(csv_path: str, out_path: str) -> None:
     import matplotlib.pyplot as plt
 
     steps, losses, sample_mses = [], [], []
+    per_image_columns = []
     with Path(csv_path).open() as handle:
         reader = csv.DictReader(handle)
+        per_image_columns = [name for name in (reader.fieldnames or []) if name.startswith("sample_mse_")]
+        per_image_series = {name: [] for name in per_image_columns}
         for row in reader:
             steps.append(int(row["step"]))
             losses.append(float(row["loss"]))
             sample_mses.append(float(row["sample_mse"]))
+            for name in per_image_columns:
+                per_image_series[name].append(float(row[name]))
 
     fig, ax = plt.subplots(figsize=(6, 4))
     ax.plot(steps, losses, label="loss", alpha=0.8)
-    ax.plot(steps, sample_mses, label="sample_mse", alpha=0.8)
+    ax.plot(steps, sample_mses, label="sample_mse", color="black", linewidth=2)
+    for name in per_image_columns:
+        ax.plot(steps, per_image_series[name], label=name, alpha=0.6, linestyle="--")
     ax.set_xlabel("step")
     ax.set_yscale("log")
     ax.set_title("Training curves")
