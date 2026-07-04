@@ -1,5 +1,23 @@
+import math
+
 import torch
 from torch import nn
+from torch.nn import functional as F
+
+
+def sinusoidal_embedding(x: torch.Tensor, dim: int, max_period: float = 10000.0) -> torch.Tensor:
+    """Map a (batch, 1) scalar in [0, 1] to a (batch, dim) sin/cos frequency embedding.
+
+    A raw scalar gives the network a single, nearly-linear feature of time; the JVP target
+    differentiates the network w.r.t. t, so u needs enough time features to represent a
+    t-dependent derivative. Differentiable in x, which the JVP tangent (dt/dt = 1) requires.
+    """
+    half = dim // 2
+    freqs = torch.exp(
+        -math.log(max_period) * torch.arange(half, device=x.device, dtype=x.dtype) / half
+    )
+    args = x * freqs[None, :]
+    return torch.cat([args.sin(), args.cos()], dim=1)
 
 
 def group_norm_groups(channels: int, max_groups: int = 32) -> int:
@@ -11,28 +29,38 @@ def group_norm_groups(channels: int, max_groups: int = 32) -> int:
 
 
 class ResidualConvBlock(nn.Module):
-    """Two GroupNorm+conv layers with a skip connection for easier optimization.
+    """Two GroupNorm+conv layers with a skip connection and per-block FiLM time conditioning.
 
     No normalization anywhere in the network was letting activation magnitudes drift
     unpredictably across the 5 different resolution levels, which is exactly the kind of
     instability this project kept fighting. GroupNorm before each conv is standard practice
     in diffusion U-Nets specifically to stabilize this.
+
+    FiLM (a per-channel scale and shift computed from the time embedding) is applied after
+    the first GroupNorm. A single time bias at the input conv gives deep layers no way to
+    change behavior with (r, t); u(z, 0, 1) at sampling and u(z_t, r, t) mid-flow must
+    produce very different outputs from similar inputs, so every block needs to see time.
+    The FiLM projection is zero-initialized so each block starts exactly at its previous
+    time-independent behavior.
     """
 
-    def __init__(self, channels: int):
+    def __init__(self, channels: int, time_dim: int):
         super().__init__()
         groups = group_norm_groups(channels)
-        self.net = nn.Sequential(
-            nn.GroupNorm(groups, channels),
-            nn.SiLU(),
-            nn.Conv2d(channels, channels, kernel_size=3, padding=1),
-            nn.GroupNorm(groups, channels),
-            nn.SiLU(),
-            nn.Conv2d(channels, channels, kernel_size=3, padding=1),
-        )
+        self.norm1 = nn.GroupNorm(groups, channels)
+        self.conv1 = nn.Conv2d(channels, channels, kernel_size=3, padding=1)
+        self.norm2 = nn.GroupNorm(groups, channels)
+        self.conv2 = nn.Conv2d(channels, channels, kernel_size=3, padding=1)
+        self.film = nn.Linear(time_dim, channels * 2)
+        nn.init.zeros_(self.film.weight)
+        nn.init.zeros_(self.film.bias)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return x + self.net(x)
+    def forward(self, x: torch.Tensor, time_features: torch.Tensor) -> torch.Tensor:
+        scale, shift = self.film(time_features)[:, :, None, None].chunk(2, dim=1)
+        hidden = self.norm1(x) * (1.0 + scale) + shift
+        hidden = self.conv1(F.silu(hidden))
+        hidden = self.conv2(F.silu(self.norm2(hidden)))
+        return x + hidden
 
 
 def attention_heads(channels: int, max_heads: int = 8) -> int:
@@ -106,10 +134,12 @@ class TinyTimeConditionedCNN(nn.Module):
     at the 8x8 bottleneck gives it a second, non-local mechanism for the same purpose, cheap
     at that resolution (64 tokens).
 
-    Time conditioning is the plain scheme (raw scalar (r, t) -> MLP -> single additive bias,
-    injected once right after the input conv) -- FiLM and sinusoidal time embeddings are
-    deliberately not used here, so this isolates the U-Net structure as the only new
-    variable versus the earlier flat-CNN experiments.
+    Time conditioning: sinusoidal embeddings of t and of the gap (t - r) -- the two
+    quantities the MeanFlow target actually depends on -- concatenated, passed through an
+    MLP, and injected into every residual block via FiLM. The earlier plain scheme (raw
+    scalar (r, t) -> single additive input bias) existed only to isolate the U-Net as the
+    experimental variable; with one input-level bias the network is structurally almost
+    incapable of representing the du/dt that the JVP target regresses.
 
     `num_blocks` is blocks *per resolution level* (5 levels total: down1, down2, bottleneck,
     up2, up1) -- keep it small (1-2) since width doubles at each of the two downsampling
@@ -124,8 +154,9 @@ class TinyTimeConditionedCNN(nn.Module):
         num_blocks: int = 2,
     ):
         super().__init__()
+        self.time_dim = time_dim
         self.time_mlp = nn.Sequential(
-            nn.Linear(2, time_dim),
+            nn.Linear(2 * time_dim, time_dim),
             nn.SiLU(),
             nn.Linear(time_dim, time_dim),
             nn.SiLU(),
@@ -136,24 +167,23 @@ class TinyTimeConditionedCNN(nn.Module):
         channels_3 = hidden_channels * 4
 
         self.input_conv = nn.Conv2d(image_channels, channels_1, kernel_size=3, padding=1)
-        self.time_to_channels = nn.Linear(time_dim, channels_1)
 
-        self.down_blocks_1 = nn.ModuleList([ResidualConvBlock(channels_1) for _ in range(num_blocks)])
+        self.down_blocks_1 = nn.ModuleList([ResidualConvBlock(channels_1, time_dim) for _ in range(num_blocks)])
         self.downsample_1 = Downsample(channels_1, channels_2)
 
-        self.down_blocks_2 = nn.ModuleList([ResidualConvBlock(channels_2) for _ in range(num_blocks)])
+        self.down_blocks_2 = nn.ModuleList([ResidualConvBlock(channels_2, time_dim) for _ in range(num_blocks)])
         self.downsample_2 = Downsample(channels_2, channels_3)
 
-        self.bottleneck_blocks = nn.ModuleList([ResidualConvBlock(channels_3) for _ in range(num_blocks)])
+        self.bottleneck_blocks = nn.ModuleList([ResidualConvBlock(channels_3, time_dim) for _ in range(num_blocks)])
         self.bottleneck_attention = SelfAttention2D(channels_3)
 
         self.upsample_2 = Upsample(channels_3, channels_2)
         self.merge_2 = nn.Conv2d(channels_2 * 2, channels_2, kernel_size=1)
-        self.up_blocks_2 = nn.ModuleList([ResidualConvBlock(channels_2) for _ in range(num_blocks)])
+        self.up_blocks_2 = nn.ModuleList([ResidualConvBlock(channels_2, time_dim) for _ in range(num_blocks)])
 
         self.upsample_1 = Upsample(channels_2, channels_1)
         self.merge_1 = nn.Conv2d(channels_1 * 2, channels_1, kernel_size=1)
-        self.up_blocks_1 = nn.ModuleList([ResidualConvBlock(channels_1) for _ in range(num_blocks)])
+        self.up_blocks_1 = nn.ModuleList([ResidualConvBlock(channels_1, time_dim) for _ in range(num_blocks)])
 
         self.output_conv = nn.Sequential(
             nn.GroupNorm(group_norm_groups(channels_1), channels_1),
@@ -167,32 +197,39 @@ class TinyTimeConditionedCNN(nn.Module):
         if t.ndim == 1:
             t = t[:, None]
 
-        time_features = self.time_mlp(torch.cat([r, t], dim=1))
-        time_bias = self.time_to_channels(time_features)[:, :, None, None]
+        time_features = self.time_mlp(
+            torch.cat(
+                [
+                    sinusoidal_embedding(t, self.time_dim),
+                    sinusoidal_embedding(t - r, self.time_dim),
+                ],
+                dim=1,
+            )
+        )
 
-        hidden = self.input_conv(z_t) + time_bias
+        hidden = self.input_conv(z_t)
         for block in self.down_blocks_1:
-            hidden = block(hidden)
+            hidden = block(hidden, time_features)
         skip_1 = hidden
         hidden = self.downsample_1(hidden)
 
         for block in self.down_blocks_2:
-            hidden = block(hidden)
+            hidden = block(hidden, time_features)
         skip_2 = hidden
         hidden = self.downsample_2(hidden)
 
         for block in self.bottleneck_blocks:
-            hidden = block(hidden)
+            hidden = block(hidden, time_features)
         hidden = self.bottleneck_attention(hidden)
 
         hidden = self.upsample_2(hidden)
         hidden = self.merge_2(torch.cat([hidden, skip_2], dim=1))
         for block in self.up_blocks_2:
-            hidden = block(hidden)
+            hidden = block(hidden, time_features)
 
         hidden = self.upsample_1(hidden)
         hidden = self.merge_1(torch.cat([hidden, skip_1], dim=1))
         for block in self.up_blocks_1:
-            hidden = block(hidden)
+            hidden = block(hidden, time_features)
 
         return self.output_conv(hidden)
