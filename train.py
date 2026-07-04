@@ -220,6 +220,11 @@ def main() -> None:
                 f"Resumed model weights from {args.resume_from} "
                 f"(saved at step {checkpoint['step']}, sample_mse={checkpoint['sample_mse']:.6f})"
             )
+        # Restore Adam's per-parameter momentum/variance too. Without this, every resume
+        # started from a cold, zero-initialized optimizer state; Adam's bias-correction then
+        # takes unusually large effective steps for the first several hundred steps regardless
+        # of how small --lr is set, which was producing large loss spikes right after resuming.
+        optimizer.load_state_dict(checkpoint["optimizer"])
         for param_group in optimizer.param_groups:
             param_group["lr"] = args.lr
 
