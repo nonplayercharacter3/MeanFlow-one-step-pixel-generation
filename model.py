@@ -1,52 +1,21 @@
-import math
-
 import torch
 from torch import nn
 
 
-class SinusoidalTimeEmbedding(nn.Module):
-    """Expands a scalar time value into sin/cos features at exponentially spaced frequencies.
+class ResidualConvBlock(nn.Module):
+    """Two convolution layers with a skip connection for easier optimization."""
 
-    A bare scalar fed straight into a linear layer is a known weak spot for representing
-    fine-grained sensitivity to small input changes (neural nets are biased toward learning
-    low-frequency functions of their raw inputs). The MeanFlow JVP term needs exactly that
-    kind of sensitivity (d/dt of the network's output), so we expand time into many
-    frequencies first, the same way diffusion timestep embeddings and transformer positional
-    encodings do.
-    """
-
-    def __init__(self, dim: int):
+    def __init__(self, channels: int):
         super().__init__()
-        assert dim % 2 == 0, "embedding dim must be even (half for sin, half for cos)"
-        self.dim = dim
-        half_dim = dim // 2
-        freqs = torch.exp(-math.log(10000.0) * torch.arange(half_dim).float() / half_dim)
-        self.register_buffer("freqs", freqs, persistent=False)
+        self.net = nn.Sequential(
+            nn.SiLU(),
+            nn.Conv2d(channels, channels, kernel_size=3, padding=1),
+            nn.SiLU(),
+            nn.Conv2d(channels, channels, kernel_size=3, padding=1),
+        )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        args = x * self.freqs[None, :]
-        return torch.cat([torch.sin(args), torch.cos(args)], dim=-1)
-
-
-class FiLMResidualConvBlock(nn.Module):
-    """Two convolutions with a skip connection, FiLM-modulated by the time embedding at every block."""
-
-    def __init__(self, channels: int, time_dim: int):
-        super().__init__()
-        self.act = nn.SiLU()
-        self.conv1 = nn.Conv2d(channels, channels, kernel_size=3, padding=1)
-        self.conv2 = nn.Conv2d(channels, channels, kernel_size=3, padding=1)
-        self.film = nn.Linear(time_dim, channels * 2)
-
-    def forward(self, x: torch.Tensor, time_features: torch.Tensor) -> torch.Tensor:
-        scale, shift = self.film(time_features).chunk(2, dim=-1)
-        scale = scale[:, :, None, None]
-        shift = shift[:, :, None, None]
-
-        hidden = self.conv1(self.act(x))
-        hidden = hidden * (1.0 + scale) + shift
-        hidden = self.conv2(self.act(hidden))
-        return x + hidden
+        return x + self.net(x)
 
 
 class Downsample(nn.Module):
@@ -76,13 +45,16 @@ class TinyTimeConditionedCNN(nn.Module):
 
     Two downsampling stages (e.g. 32 -> 16 -> 8) with skip connections, so the network
     can mix information across the whole image cheaply at low resolution instead of only
-    ever operating at full resolution with local 3x3 receptive fields. Time is injected via
-    FiLM (per-block scale/shift, from a sinusoidal time embedding) at every block, at every
-    resolution level.
+    ever operating at full resolution with local 3x3 receptive fields.
+
+    Time conditioning is the plain scheme (raw scalar (r, t) -> MLP -> single additive bias,
+    injected once right after the input conv) -- FiLM and sinusoidal time embeddings are
+    deliberately not used here, so this isolates the U-Net structure as the only new
+    variable versus the earlier flat-CNN experiments.
 
     `num_blocks` is blocks *per resolution level* (5 levels total: down1, down2, bottleneck,
-    up2, up1) -- keep it small (1-2) to stay in the same size ballpark as a deeper flat CNN,
-    since width doubles at each of the two downsampling stages.
+    up2, up1) -- keep it small (1-2) since width doubles at each of the two downsampling
+    stages, or parameter count grows fast.
     """
 
     def __init__(
@@ -93,9 +65,8 @@ class TinyTimeConditionedCNN(nn.Module):
         num_blocks: int = 2,
     ):
         super().__init__()
-        self.time_embed = SinusoidalTimeEmbedding(time_dim)
         self.time_mlp = nn.Sequential(
-            nn.Linear(time_dim * 2, time_dim),
+            nn.Linear(2, time_dim),
             nn.SiLU(),
             nn.Linear(time_dim, time_dim),
             nn.SiLU(),
@@ -106,24 +77,23 @@ class TinyTimeConditionedCNN(nn.Module):
         channels_3 = hidden_channels * 4
 
         self.input_conv = nn.Conv2d(image_channels, channels_1, kernel_size=3, padding=1)
+        self.time_to_channels = nn.Linear(time_dim, channels_1)
 
-        self.down_blocks_1 = nn.ModuleList([FiLMResidualConvBlock(channels_1, time_dim) for _ in range(num_blocks)])
+        self.down_blocks_1 = nn.ModuleList([ResidualConvBlock(channels_1) for _ in range(num_blocks)])
         self.downsample_1 = Downsample(channels_1, channels_2)
 
-        self.down_blocks_2 = nn.ModuleList([FiLMResidualConvBlock(channels_2, time_dim) for _ in range(num_blocks)])
+        self.down_blocks_2 = nn.ModuleList([ResidualConvBlock(channels_2) for _ in range(num_blocks)])
         self.downsample_2 = Downsample(channels_2, channels_3)
 
-        self.bottleneck_blocks = nn.ModuleList(
-            [FiLMResidualConvBlock(channels_3, time_dim) for _ in range(num_blocks)]
-        )
+        self.bottleneck_blocks = nn.ModuleList([ResidualConvBlock(channels_3) for _ in range(num_blocks)])
 
         self.upsample_2 = Upsample(channels_3, channels_2)
         self.merge_2 = nn.Conv2d(channels_2 * 2, channels_2, kernel_size=1)
-        self.up_blocks_2 = nn.ModuleList([FiLMResidualConvBlock(channels_2, time_dim) for _ in range(num_blocks)])
+        self.up_blocks_2 = nn.ModuleList([ResidualConvBlock(channels_2) for _ in range(num_blocks)])
 
         self.upsample_1 = Upsample(channels_2, channels_1)
         self.merge_1 = nn.Conv2d(channels_1 * 2, channels_1, kernel_size=1)
-        self.up_blocks_1 = nn.ModuleList([FiLMResidualConvBlock(channels_1, time_dim) for _ in range(num_blocks)])
+        self.up_blocks_1 = nn.ModuleList([ResidualConvBlock(channels_1) for _ in range(num_blocks)])
 
         self.output_conv = nn.Sequential(
             nn.SiLU(),
@@ -136,30 +106,31 @@ class TinyTimeConditionedCNN(nn.Module):
         if t.ndim == 1:
             t = t[:, None]
 
-        time_features = self.time_mlp(torch.cat([self.time_embed(r), self.time_embed(t)], dim=1))
+        time_features = self.time_mlp(torch.cat([r, t], dim=1))
+        time_bias = self.time_to_channels(time_features)[:, :, None, None]
 
-        hidden = self.input_conv(z_t)
+        hidden = self.input_conv(z_t) + time_bias
         for block in self.down_blocks_1:
-            hidden = block(hidden, time_features)
+            hidden = block(hidden)
         skip_1 = hidden
         hidden = self.downsample_1(hidden)
 
         for block in self.down_blocks_2:
-            hidden = block(hidden, time_features)
+            hidden = block(hidden)
         skip_2 = hidden
         hidden = self.downsample_2(hidden)
 
         for block in self.bottleneck_blocks:
-            hidden = block(hidden, time_features)
+            hidden = block(hidden)
 
         hidden = self.upsample_2(hidden)
         hidden = self.merge_2(torch.cat([hidden, skip_2], dim=1))
         for block in self.up_blocks_2:
-            hidden = block(hidden, time_features)
+            hidden = block(hidden)
 
         hidden = self.upsample_1(hidden)
         hidden = self.merge_1(torch.cat([hidden, skip_1], dim=1))
         for block in self.up_blocks_1:
-            hidden = block(hidden, time_features)
+            hidden = block(hidden)
 
         return self.output_conv(hidden)
