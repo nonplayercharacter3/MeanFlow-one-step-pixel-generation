@@ -101,6 +101,18 @@ def parse_args():
     parser.add_argument("--hidden-channels", type=int, default=128)
     parser.add_argument("--time-dim", type=int, default=64)
     parser.add_argument("--num-blocks", type=int, default=4)
+    parser.add_argument("--grad-clip", type=float, default=1.0, help="Max gradient norm. Set to 0 to disable.")
+    parser.add_argument(
+        "--resume-from",
+        type=str,
+        default=None,
+        help="Path to a checkpoint to warm-start from (e.g. checkpoint_best.pt).",
+    )
+    parser.add_argument(
+        "--no-lr-decay",
+        action="store_true",
+        help="Use a constant --lr instead of cosine decay. Useful when warm-starting from --resume-from.",
+    )
     return parser.parse_args()
 
 
@@ -135,7 +147,22 @@ def main() -> None:
     ).to(device=device, dtype=torch.float32)
     print(f"Model trainable parameters: {count_trainable_parameters(model):,}")
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.steps, eta_min=args.lr * 0.01)
+
+    if args.resume_from:
+        checkpoint = torch.load(args.resume_from, map_location=device)
+        model.load_state_dict(checkpoint["model"])
+        print(
+            f"Resumed model weights from {args.resume_from} "
+            f"(saved at step {checkpoint['step']}, sample_mse={checkpoint['sample_mse']:.6f})"
+        )
+        for param_group in optimizer.param_groups:
+            param_group["lr"] = args.lr
+
+    scheduler = (
+        None
+        if args.no_lr_decay
+        else torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.steps, eta_min=args.lr * 0.01)
+    )
 
     run_sanity_checks(model, optimizer, clean_image)
 
@@ -153,8 +180,11 @@ def main() -> None:
 
         optimizer.zero_grad(set_to_none=True)
         result.loss.backward()
+        if args.grad_clip > 0:
+            torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
         optimizer.step()
-        scheduler.step()
+        if scheduler is not None:
+            scheduler.step()
 
         with torch.no_grad():
             sample = one_step_sample(model, fixed_eval_noise)
@@ -178,9 +208,10 @@ def main() -> None:
                 result.loss,
                 sample,
             )
+            current_lr = scheduler.get_last_lr()[0] if scheduler is not None else optimizer.param_groups[0]["lr"]
             print(
                 f"step={step:04d}",
-                f"lr={scheduler.get_last_lr()[0]:.6f}",
+                f"lr={current_lr:.6f}",
                 f"loss={loss_value:.6f}",
                 f"sample_mse={sample_mse:.6f}",
                 f"|u|={result.mean_velocity.abs().mean().item():.4f}",
