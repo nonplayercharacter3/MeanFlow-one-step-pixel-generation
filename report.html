@@ -351,30 +351,37 @@ to mean nearest-image <code>sample_mse=0.0094</code> (per image 0.0021 / 0.0050 
 
 <h3>3.1 Single-image overfit (supporting result)</h3>
 <p>
-Status: <span class="status-done">reached</span> — <code>sample_mse = 0.012</code> with the bigger model
-(<code>hidden_channels=256, num_blocks=6, lr=3e-4</code>, gradient clipping, endpoint-biased time sampling), visually
-near-identical reconstruction.
+Status: <span class="status-done">reached</span>, twice. Historically: <code>sample_mse = 0.012</code> with the
+flat CNN at <code>hidden_channels=256, num_blocks=6</code> (the Problem 3 capacity fix) — that architecture has
+since been replaced by the final U-Net, and the run's images were not preserved, so the number survives only in
+the experiment log. Re-verified with the submitted final model and recipe:
 </p>
+<div class="row">
+  <figure class="figure">
+    <img src="report_assets/overfit1_clean.png" alt="single-image clean target" />
+    <figcaption>Clean (target)</figcaption>
+  </figure>
+  <figure class="figure">
+    <img src="report_assets/overfit1_sample.png" alt="best one-step sample, final model" />
+    <figcaption>Best one-step sample, final U-Net (sample_mse: see caption TODO)</figcaption>
+  </figure>
+</div>
+<div class="figure">
+  <img src="report_assets/overfit1_loss_curve.png" alt="single-image loss curve" style="max-width:480px" />
+</div>
+<p>Reproduce command (~3 min on a Colab L4):</p>
+<pre>python train.py --images data/overfit1/imagenette_one.png \
+  --steps 1500 --batch-size 32 --lr 5e-4 --hidden-channels 128 --num-blocks 2 \
+  --time-sampling logit_normal --equal-time-probability 0.5 --endpoint-probability 0.1 \
+  --loss-weight-power 0.75 --adaptive-lr --lr-patience 150 --ema-decay 0.99 \
+  --sample-every 500 --checkpoint-every 500 --output-dir outputs/overfit1_final</pre>
 <div class="todo">
-<strong>TODO before submitting:</strong> this run (<code>outputs/bigger_model_clipped/</code>) currently only exists
-in the Colab session/Drive it was trained in. Note that <code>outputs/</code> is gitignored (checkpoints are too
-large to track), so copy just the small PNGs into <code>report_assets/</code> (which <em>is</em> tracked) instead
-of referencing <code>outputs/</code> directly:
-<pre>cp outputs/bigger_model_clipped/clean.png report_assets/bigger_model_clean.png
-cp outputs/bigger_model_clipped/sample_best.png report_assets/bigger_model_sample.png
-cp outputs/bigger_model_clipped/loss_curve.png report_assets/bigger_model_loss_curve.png</pre>
-then replace the placeholder row directly under this box with:
-<pre>&lt;div class="row"&gt;
-  &lt;figure class="figure"&gt;&lt;img src="report_assets/bigger_model_clean.png"&gt;&lt;figcaption&gt;Clean (target)&lt;/figcaption&gt;&lt;/figure&gt;
-  &lt;figure class="figure"&gt;&lt;img src="report_assets/bigger_model_sample.png"&gt;&lt;figcaption&gt;Best one-step sample (sample_mse=0.012)&lt;/figcaption&gt;&lt;/figure&gt;
-&lt;/div&gt;
-&lt;div class="figure"&gt;&lt;img src="report_assets/bigger_model_loss_curve.png" style="max-width:480px"&gt;&lt;/div&gt;</pre>
-If <code>loss_curve.png</code> isn't in that folder (it predates the auto-plotting feature), regenerate it with:
-<pre>python -c "from utils import save_loss_curve; save_loss_curve('outputs/bigger_model_clipped/loss_history.csv', 'outputs/bigger_model_clipped/loss_curve.png')"</pre>
-Reproduce command:
-<pre>python train.py --images data/overfit1/imagenette_one.png --steps 5000 --batch-size 8 \
-  --lr 3e-4 --hidden-channels 256 --num-blocks 6 \
-  --sample-every 500 --checkpoint-every 1000 --output-dir outputs/bigger_model_clipped</pre>
+<strong>TODO before submitting:</strong> run the command above in Colab, then copy from
+<code>outputs/overfit1_final/</code> into <code>report_assets/</code>:
+<pre>clean_0.png       &rarr; report_assets/overfit1_clean.png
+sample_best_0.png &rarr; report_assets/overfit1_sample.png
+loss_curve.png    &rarr; report_assets/overfit1_loss_curve.png</pre>
+and fill the best <code>sample_mse</code> (printed at the end of training) into the figure caption above.
 </div>
 
 <h3>3.2 Three-image overfit (required bottom line)</h3>
