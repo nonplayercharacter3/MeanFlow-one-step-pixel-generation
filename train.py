@@ -7,7 +7,7 @@ from torch.func import jvp
 
 from meanflow import MeanFlowBatch, make_meanflow_batch, meanflow_loss, one_step_sample
 from model import TinyTimeConditionedCNN
-from utils import all_finite, append_loss_csv, load_image, save_image, save_image_grid, set_seed
+from utils import all_finite, append_loss_csv, load_image, save_image, save_image_grid, save_loss_curve, set_seed
 
 
 def analytical_jvp_check(device: torch.device) -> None:
@@ -237,6 +237,8 @@ def main() -> None:
 
         if step % args.checkpoint_every == 0 or step == args.steps:
             save_checkpoint(output_dir / "checkpoint.pt", step, model, optimizer, args, sample_mse)
+
+    save_loss_curve(str(loss_csv), str(output_dir / "loss_curve.png"))
 
     print(f"Best sample_mse={best_sample_mse:.6f}")
     print(f"Done. Outputs saved in {output_dir}")

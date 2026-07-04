@@ -63,3 +63,30 @@ def append_loss_csv(path: str, step: int, loss: float, sample_mse: float) -> Non
 
 def all_finite(*tensors: torch.Tensor) -> bool:
     return all(torch.isfinite(tensor).all().item() for tensor in tensors)
+
+
+def save_loss_curve(csv_path: str, out_path: str) -> None:
+    """Read a loss_history.csv and save a loss/sample_mse-vs-step plot."""
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    steps, losses, sample_mses = [], [], []
+    with Path(csv_path).open() as handle:
+        reader = csv.DictReader(handle)
+        for row in reader:
+            steps.append(int(row["step"]))
+            losses.append(float(row["loss"]))
+            sample_mses.append(float(row["sample_mse"]))
+
+    fig, ax = plt.subplots(figsize=(6, 4))
+    ax.plot(steps, losses, label="loss", alpha=0.8)
+    ax.plot(steps, sample_mses, label="sample_mse", alpha=0.8)
+    ax.set_xlabel("step")
+    ax.set_yscale("log")
+    ax.set_title("Training curves")
+    ax.legend()
+    fig.tight_layout()
+    fig.savefig(out_path)
+    plt.close(fig)

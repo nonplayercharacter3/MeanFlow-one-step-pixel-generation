@@ -1,0 +1,314 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<title>MeanFlow: One-Step Pixel-Space Generation — Report</title>
+<style>
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    max-width: 900px;
+    margin: 0 auto;
+    padding: 2rem 1.5rem 4rem;
+    line-height: 1.55;
+    color: #1a1a1a;
+    background: #fff;
+  }
+  h1 { font-size: 1.9rem; margin-bottom: 0.2rem; }
+  h2 { font-size: 1.35rem; margin-top: 2.5rem; border-bottom: 2px solid #eee; padding-bottom: 0.3rem; }
+  h3 { font-size: 1.1rem; margin-top: 1.5rem; }
+  .subtitle { color: #666; margin-top: 0; }
+  code, pre {
+    background: #f4f4f6;
+    border-radius: 4px;
+    font-size: 0.9em;
+    padding: 0.15em 0.4em;
+  }
+  pre { padding: 0.8em 1em; overflow-x: auto; }
+  .figure {
+    margin: 1.2rem 0;
+    text-align: center;
+  }
+  .figure img {
+    max-width: 100%;
+    border: 1px solid #ddd;
+    border-radius: 6px;
+  }
+  .figure figcaption {
+    font-size: 0.85rem;
+    color: #555;
+    margin-top: 0.4rem;
+  }
+  .row {
+    display: flex;
+    gap: 1rem;
+    flex-wrap: wrap;
+    justify-content: center;
+  }
+  .row .figure { flex: 1 1 260px; max-width: 320px; }
+  table {
+    border-collapse: collapse;
+    width: 100%;
+    margin: 1rem 0;
+    font-size: 0.92rem;
+  }
+  th, td {
+    border: 1px solid #ddd;
+    padding: 0.5rem 0.7rem;
+    text-align: left;
+  }
+  th { background: #f7f7f9; }
+  .todo {
+    border: 2px dashed #e0a800;
+    background: #fffbea;
+    border-radius: 6px;
+    padding: 1rem;
+    margin: 1rem 0;
+    font-size: 0.92rem;
+  }
+  .todo strong { color: #8a6500; }
+  .status-done { color: #1a7a1a; font-weight: 600; }
+  .status-pending { color: #b35c00; font-weight: 600; }
+  .callout {
+    background: #f0f6ff;
+    border-left: 4px solid #3b82f6;
+    padding: 0.8rem 1rem;
+    margin: 1rem 0;
+    font-size: 0.93rem;
+  }
+</style>
+</head>
+<body>
+
+<h1>MeanFlow: One-Step Pixel-Space Generation</h1>
+<p class="subtitle">LR-1 — Latent Reasoning track. PyTorch port of MeanFlow, targeting pixel-space one-step image generation.</p>
+
+<div class="callout">
+<strong>How to read this report:</strong> sections marked <span class="status-pending">PENDING</span> contain
+placeholders — this report was generated before the required 3-image overfit run finished executing on GPU.
+Every placeholder names the exact file to drop in once that run completes; no numbers or images below are
+fabricated to look better than what was actually measured.
+</div>
+
+<h2>1. What MeanFlow Is, and What I Built</h2>
+
+<p>
+Standard flow matching learns an <em>instantaneous</em> velocity field <code>v(z_t, t)</code> and generates an
+image by numerically integrating an ODE through many small steps (an N-step solver). MeanFlow instead trains a
+network to directly predict the <strong>average velocity</strong> over an entire time interval:
+</p>
+<pre>u(z_t, r, t) = (1 / (t - r)) &int;<sub>r</sub><sup>t</sup> v(z_&tau;, &tau;) d&tau;</pre>
+<p>
+If you can learn <code>u</code> accurately for the full interval <code>(r=0, t=1)</code>, generation collapses to a
+single subtraction: <code>x&#8320; &asymp; x&#8321; - u(x&#8321;, 0, 1)</code> — one network evaluation, no ODE solver
+needed. That's the entire appeal: same underlying flow-matching framework, but the sampler becomes 1-NFE instead of
+N-NFE.
+</p>
+
+<h3>The identity that makes this trainable</h3>
+<p>
+You can't directly supervise <code>u</code> against ground truth (you don't have it), so MeanFlow uses an identity
+relating the average velocity to the instantaneous one via a <strong>total derivative along the flow</strong>:
+</p>
+<pre>u(z_t, r, t) = v(z_t, t) - (t - r) &middot; d/dt[u(z_t, r, t)]</pre>
+<p>
+The <code>d/dt</code> term is a directional derivative of the network's own output with respect to its inputs
+<code>(z_t, r, t)</code>, moving along the direction the flow is actually taking. In PyTorch this is exactly what
+<code>torch.func.jvp</code> computes: a Jacobian-vector product with tangent <code>(v, 0, 1)</code> paired against
+inputs <code>(z_t, r, t)</code> — <code>v</code> because <code>z_t</code> moves with velocity <code>v</code>,
+<code>0</code> because <code>r</code> is held fixed during this derivative, <code>1</code> because <code>t</code>
+advances at unit rate. The target on the right-hand side is <strong>detached</strong> (stop-gradient) — gradients
+only flow through the network's direct <code>u</code> prediction on the left, matching the paper.
+</p>
+<p>Concretely, in <code>meanflow.py</code>:</p>
+<pre>mean_velocity, jvp_term = jvp(
+    model_fn,
+    (z_t, r, t),
+    (velocity, zeros_like(r), ones_like(t)),
+)
+target = (velocity - (t - r) * jvp_term).detach()
+loss = MSE(mean_velocity, target)</pre>
+
+<h3>Concrete setup</h3>
+<table>
+<tr><th>Choice</th><th>Value</th></tr>
+<tr><td>Data</td><td>Imagenette (fastai/imagenette), fixed images, pixel space</td></tr>
+<tr><td>Resolution</td><td>32&times;32, RGB, normalized to [-1, 1]</td></tr>
+<tr><td>Model</td><td>Tiny time-conditioned residual CNN (final config: hidden_channels=256, 6 residual blocks)</td></tr>
+<tr><td>Conditioning</td><td>Unconditional (no class label)</td></tr>
+<tr><td>Sampler</td><td>One-step (1-NFE): <code>x&#8320; &asymp; noise - u&theta;(noise, 0, 1)</code></td></tr>
+<tr><td>Time sampling</td><td><code>r, t</code> uniform with <code>r &le; t</code>; 10% forced <code>r=t</code>; 25% forced <code>(r,t)=(0,1)</code> (see Problem 1)</td></tr>
+</table>
+
+<h2>2. Problems Hit and How They Were Solved</h2>
+<p>This section is the actual debugging journey, in the order the issues appeared.</p>
+
+<h3>Problem 1 — Loss goes down, but the one-step sample doesn't reproduce the image</h3>
+<p>
+The first working pipeline passed every sanity check (finite gradients, correct shapes, the analytical JVP unit
+test, parameters updating) and training loss decreased steadily. But the one-step reconstruction from a fixed noise
+vector stayed noisy regardless of how long training ran.
+</p>
+<div class="row">
+  <figure class="figure">
+    <img src="report_assets/debug_lr3e4_clean.png" alt="clean target" />
+    <figcaption>Target image (32&times;32 Imagenette crop)</figcaption>
+  </figure>
+  <figure class="figure">
+    <img src="report_assets/debug_lr3e4_sample.png" alt="noisy one-step sample" />
+    <figcaption>One-step sample after 10,000 steps, lr=3e-4 (best sample_mse&asymp;0.250, step 2441)</figcaption>
+  </figure>
+</div>
+<div class="figure">
+  <img src="report_assets/debug_lr3e4_loss_curve.png" alt="loss curve, low-lr experiment" style="max-width:480px" />
+  <figcaption>Loss decreases and stays low; sample_mse (one-step reconstruction error) does not follow it down.</figcaption>
+</div>
+<p>
+<strong>Diagnosis:</strong> the one-step sampler is always evaluated at exactly <code>(r=0, t=1)</code> — the
+largest possible time gap. But <code>sample_times()</code> drew <code>r, t</code> as independent uniforms and
+sorted them, which gives a <em>triangular</em> distribution over the gap <code>t-r</code> that peaks at 0. Most
+training batches were small-gap cases where the JVP correction barely matters; the network almost never practiced
+the one case it's actually judged on at inference. I confirmed this wasn't a training-length problem by forcing
+<code>r == t</code> for the whole batch (pure flow-matching diagnostic, <code>debug_equal_times</code> run) —
+training loss dropped even faster, but endpoint sample quality got <em>worse</em>, showing that low loss on
+easy/small-gap pairs doesn't imply a good <code>(0,1)</code> estimate.
+</p>
+<p>
+<strong>Fix:</strong> explicitly force a fraction of every batch (25%) to use <code>(r, t) = (0, 1)</code> directly
+(<code>meanflow.py: sample_times()</code>), on top of the existing random sampling and the 10% <code>r==t</code>
+stabilizer. This gives the network direct, repeated practice on the exact query used at generation time.
+</p>
+<div class="row">
+  <figure class="figure">
+    <img src="report_assets/debug_endpoint_bias_clean.png" alt="clean target" />
+    <figcaption>Target image</figcaption>
+  </figure>
+  <figure class="figure">
+    <img src="report_assets/debug_endpoint_bias_sample.png" alt="improved sample after endpoint bias" />
+    <figcaption>Best one-step sample after adding endpoint bias (sample_mse=0.146 at step 336 — down from ~0.25-0.27)</figcaption>
+  </figure>
+</div>
+<div class="figure">
+  <img src="report_assets/debug_endpoint_bias_loss_curve.png" alt="loss curve after endpoint bias fix" style="max-width:480px" />
+  <figcaption>sample_mse now tracks meaningfully lower, confirming the fix targeted the right thing.</figcaption>
+</div>
+
+<h3>Problem 2 — Training destabilizes after finding a good minimum</h3>
+<p>
+With the endpoint-bias fix in place, longer runs (5000 steps) would find a good <code>sample_mse</code> partway
+through, then the loss would start climbing again (spikes up to 2&times; the surrounding steps) and drift away
+from that minimum, ending training at a substantially worse point than the best one seen mid-run.
+</p>
+<p>
+<strong>Diagnosis:</strong> forcing <code>(r,t)=(0,1)</code> means <code>time_gap = t - r = 1</code> for those
+samples — the full JVP correction term gets added at maximum strength (<code>target = velocity - 1&middot;jvp_term</code>),
+so any noise in the JVP estimate injects a full-strength gradient spike. Combined with a fixed learning rate and no
+gradient clipping, this occasionally kicked the weights out of a good region.
+</p>
+<p>
+<strong>Fix:</strong> (1) gradient clipping (<code>torch.nn.utils.clip_grad_norm_</code>, max norm 1.0, on by
+default) to cap spike magnitude; (2) a <code>--resume-from</code> flag to warm-start from a saved best checkpoint at
+a small constant LR, for polishing runs that don't need to rediscover the minimum from scratch; (3) cosine LR decay
+as a secondary stabilizer for fresh runs. After these changes, <code>sample_mse</code> curves are flat/stable
+rather than climbing back up late in training.
+</p>
+
+<h3>Problem 3 — Stable training plateaus below the quality needed to "reproduce" the image</h3>
+<p>
+Once training was stable, <code>sample_mse</code> settled into a flat band (~0.09&ndash;0.13) and additional steps
+or polishing at low LR didn't move it further — a flat, non-drifting metric that won't improve with more optimization
+time is the signature of a <strong>capacity ceiling</strong>, not an optimization problem. Visually: coarse
+structure (sky, silhouette, borders) was correct, but fine texture stayed speckled.
+</p>
+<p>
+<strong>Fix:</strong> increased model capacity from <code>hidden_channels=128, num_blocks=4</code> (~1.2M params) to
+<code>hidden_channels=256, num_blocks=6</code>. This dropped best <code>sample_mse</code> to <strong>0.012</strong>
+on the single-image case (see Section 3) — an 8&times; improvement over the plateaued tiny model, and visually
+near-indistinguishable from the target.
+</p>
+
+<h2>3. Results</h2>
+
+<h3>3.1 Single-image overfit (supporting result)</h3>
+<p>
+Status: <span class="status-done">reached</span> — <code>sample_mse = 0.012</code> with the bigger model
+(<code>hidden_channels=256, num_blocks=6, lr=3e-4</code>, gradient clipping, endpoint-biased time sampling), visually
+near-identical reconstruction.
+</p>
+<div class="todo">
+<strong>TODO before submitting:</strong> this run (<code>outputs/bigger_model_clipped/</code>) currently only exists
+in the Colab session/Drive it was trained in. Note that <code>outputs/</code> is gitignored (checkpoints are too
+large to track), so copy just the small PNGs into <code>report_assets/</code> (which <em>is</em> tracked) instead
+of referencing <code>outputs/</code> directly:
+<pre>cp outputs/bigger_model_clipped/clean.png report_assets/bigger_model_clean.png
+cp outputs/bigger_model_clipped/sample_best.png report_assets/bigger_model_sample.png
+cp outputs/bigger_model_clipped/loss_curve.png report_assets/bigger_model_loss_curve.png</pre>
+then replace the placeholder row directly under this box with:
+<pre>&lt;div class="row"&gt;
+  &lt;figure class="figure"&gt;&lt;img src="report_assets/bigger_model_clean.png"&gt;&lt;figcaption&gt;Clean (target)&lt;/figcaption&gt;&lt;/figure&gt;
+  &lt;figure class="figure"&gt;&lt;img src="report_assets/bigger_model_sample.png"&gt;&lt;figcaption&gt;Best one-step sample (sample_mse=0.012)&lt;/figcaption&gt;&lt;/figure&gt;
+&lt;/div&gt;
+&lt;div class="figure"&gt;&lt;img src="report_assets/bigger_model_loss_curve.png" style="max-width:480px"&gt;&lt;/div&gt;</pre>
+If <code>loss_curve.png</code> isn't in that folder (it predates the auto-plotting feature), regenerate it with:
+<pre>python -c "from utils import save_loss_curve; save_loss_curve('outputs/bigger_model_clipped/loss_history.csv', 'outputs/bigger_model_clipped/loss_curve.png')"</pre>
+Reproduce command:
+<pre>python train.py --images data/overfit1/imagenette_one.png --steps 5000 --batch-size 8 \
+  --lr 3e-4 --hidden-channels 256 --num-blocks 6 \
+  --sample-every 500 --checkpoint-every 1000 --output-dir outputs/bigger_model_clipped</pre>
+</div>
+
+<h3>3.2 Three-image overfit (required bottom line)</h3>
+<p>
+Status: <span class="status-pending">PENDING</span> — this is the assignment's required milestone
+("overfit 3 training examples perfectly... proves the objective + sampler are correct end-to-end") and has not
+finished running yet at the time this report was drafted.
+</p>
+<div class="todo">
+<strong>TODO before submitting:</strong> run the three-image experiment (Colab cell already set up), then copy the
+small PNGs into <code>report_assets/</code> (tracked in git, unlike <code>outputs/</code>):
+<pre>cp outputs/overfit3/clean_grid.png report_assets/overfit3_clean_grid.png
+cp outputs/overfit3/sample_best_grid.png report_assets/overfit3_sample_grid.png
+cp outputs/overfit3/loss_curve.png report_assets/overfit3_loss_curve.png</pre>
+then replace this whole subsection with:
+<pre>&lt;div class="row"&gt;
+  &lt;figure class="figure"&gt;&lt;img src="report_assets/overfit3_clean_grid.png"&gt;&lt;figcaption&gt;Clean (3 targets)&lt;/figcaption&gt;&lt;/figure&gt;
+  &lt;figure class="figure"&gt;&lt;img src="report_assets/overfit3_sample_grid.png"&gt;&lt;figcaption&gt;Best one-step samples&lt;/figcaption&gt;&lt;/figure&gt;
+&lt;/div&gt;
+&lt;div class="figure"&gt;&lt;img src="report_assets/overfit3_loss_curve.png" style="max-width:480px"&gt;&lt;/div&gt;
+&lt;p&gt;Best sample_mse: &lt;!-- fill in from checkpoint_best.pt --&gt;&lt;/p&gt;</pre>
+Reproduce command:
+<pre>python train.py \
+  --images data/overfit3/image_0.png data/overfit3/image_1.png data/overfit3/image_2.png \
+  --steps 5000 --batch-size 9 --lr 3e-4 --hidden-channels 256 --num-blocks 6 \
+  --sample-every 500 --checkpoint-every 1000 --output-dir outputs/overfit3</pre>
+Given the single-image result (0.012) used the same architecture, learning rate, clipping, and time-sampling
+scheme, the three-image run is expected to reach comparable per-image quality — but this must be verified, not
+assumed.
+</div>
+
+<h3>3.3 Ten-class Imagenette generalization (bonus, not attempted)</h3>
+<p>
+Not attempted. The required bottom line (3-image overfit) was prioritized first, per the assignment's own guidance
+("If 3 images won't overfit, scaling up won't help").
+</p>
+
+<h2>4. Known Limitations</h2>
+<ul>
+  <li>Model is intentionally small (a few million parameters); no attention, no U-Net-style downsampling — a plain
+  residual CNN with additive time conditioning.</li>
+  <li>Only unconditional generation; class conditioning was not implemented (assignment marks this optional).</li>
+  <li>Three-image and 10-class results are not yet verified end-to-end (see TODOs above).</li>
+  <li>Batch composition when cycling through more images than fit evenly into <code>--batch-size</code> is not
+  perfectly balanced (uses ceiling-division tiling then truncation) — fine for small image counts like 3, would need
+  revisiting for larger sets.</li>
+</ul>
+
+<h2>5. Reproducibility</h2>
+<p>
+Full setup, exact commands, and all CLI flags are documented in
+<a href="README.md">README.md</a>. Every experiment referenced above records: exact command, seed (default 0
+unless noted), learning rate, steps, batch size, resolution (32&times;32 throughout), and time-sampling
+probabilities — reflected in the commands shown inline in this report.
+</p>
+
+</body>
+</html>
