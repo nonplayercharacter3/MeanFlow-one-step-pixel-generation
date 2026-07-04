@@ -2,7 +2,6 @@ import argparse
 from pathlib import Path
 
 import torch
-import torch.nn.functional as F
 from torch.func import jvp
 
 from meanflow import MeanFlowBatch, make_meanflow_batch, meanflow_loss, one_step_sample
@@ -201,6 +200,13 @@ def parse_args():
         default=1e-3,
         help="Small constant in the adaptive loss weighting denominator, avoids division by zero.",
     )
+    parser.add_argument(
+        "--num-eval-noises",
+        type=int,
+        default=8,
+        help="Number of fixed noises used for the assignment-free eval. More noises make it likelier "
+        "that every training image has at least one eval noise inside its basin.",
+    )
     return parser.parse_args()
 
 
@@ -302,12 +308,19 @@ def main() -> None:
 
     run_sanity_checks(model, optimizer, clean_image)
 
-    fixed_eval_noise = torch.randn(num_images, 3, args.image_size, args.image_size, device=device)
+    # The eval is assignment-free: MeanFlow never promises that noise i maps to image i --
+    # the learned marginal flow picks its own noise->image basins. Pairing fixed_noise[i]
+    # with image[i] (the old scheme) reported a large "error" whenever a noise sat in
+    # another image's basin, even while every sample was a clean copy of *some* training
+    # image. So we sample more noises than images and score each image by its best
+    # reproduction across all of them.
+    num_eval_noises = max(args.num_eval_noises, num_images)
+    fixed_eval_noise = torch.randn(num_eval_noises, 3, args.image_size, args.image_size, device=device)
     torch.save(fixed_eval_noise.detach().cpu(), output_dir / "fixed_eval_noise.pt")
     for index in range(num_images):
         save_image(base_images[index : index + 1], str(output_dir / f"clean_{index}.png"))
-        save_image(fixed_eval_noise[index : index + 1], str(output_dir / f"fixed_noise_{index}.png"))
     save_image_grid(base_images, str(output_dir / "clean_grid.png"))
+    save_image_grid(fixed_eval_noise, str(output_dir / "fixed_eval_noise_grid.png"))
 
     loss_csv = output_dir / "loss_history.csv"
     best_sample_mse = float("inf")
@@ -350,8 +363,14 @@ def main() -> None:
                     sample = one_step_sample(eval_model, fixed_eval_noise)
                 else:
                     sample = one_step_sample(model, fixed_eval_noise)
-                sample_mse = F.mse_loss(sample, base_images).item()
-                per_image_mse = F.mse_loss(sample, base_images, reduction="none").mean(dim=(1, 2, 3)).tolist()
+                # (num_eval_noises, num_images) MSE between every sample and every image.
+                pairwise_mse = ((sample[:, None] - base_images[None, :]) ** 2).mean(dim=(2, 3, 4))
+                nearest_mse, nearest_image = pairwise_mse.min(dim=1)
+                # sample_mse: are all samples clean copies of some training image?
+                sample_mse = nearest_mse.mean().item()
+                # per_image_mse: how well is each image reproduced by its best-matching noise?
+                per_image_mse, best_noise_index = pairwise_mse.min(dim=0)
+                per_image_mse = per_image_mse.tolist()
 
             if args.reweight_images:
                 per_image_mse_tensor = torch.tensor(per_image_mse, device=device)
@@ -368,8 +387,13 @@ def main() -> None:
                 best_sample_mse = sample_mse
                 save_checkpoint(output_dir / "checkpoint_best.pt", step, model, optimizer, args, sample_mse, ema)
                 for index in range(num_images):
-                    save_image(sample[index : index + 1], str(output_dir / f"sample_best_{index}.png"))
-                save_image_grid(sample, str(output_dir / "sample_best_grid.png"))
+                    best_sample = sample[best_noise_index[index] : best_noise_index[index] + 1]
+                    save_image(best_sample, str(output_dir / f"sample_best_{index}.png"))
+                # Sort by (assigned image, error) so the basins read left to right.
+                order = sorted(
+                    range(num_eval_noises), key=lambda i: (nearest_image[i].item(), nearest_mse[i].item())
+                )
+                save_image_grid(sample[order], str(output_dir / "sample_best_grid.png"))
 
             if step == 1 or step % 50 == 0:
                 finite = all_finite(
