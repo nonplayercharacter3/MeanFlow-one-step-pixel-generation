@@ -2,24 +2,34 @@ import torch
 from torch import nn
 
 
-class ResidualConvBlock(nn.Module):
-    """Two convolution layers with a skip connection for easier optimization."""
+class FiLMResidualConvBlock(nn.Module):
+    """Two convolutions with a skip connection, FiLM-modulated by the time embedding at every block."""
 
-    def __init__(self, channels: int):
+    def __init__(self, channels: int, time_dim: int):
         super().__init__()
-        self.net = nn.Sequential(
-            nn.SiLU(),
-            nn.Conv2d(channels, channels, kernel_size=3, padding=1),
-            nn.SiLU(),
-            nn.Conv2d(channels, channels, kernel_size=3, padding=1),
-        )
+        self.act = nn.SiLU()
+        self.conv1 = nn.Conv2d(channels, channels, kernel_size=3, padding=1)
+        self.conv2 = nn.Conv2d(channels, channels, kernel_size=3, padding=1)
+        self.film = nn.Linear(time_dim, channels * 2)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return x + self.net(x)
+    def forward(self, x: torch.Tensor, time_features: torch.Tensor) -> torch.Tensor:
+        scale, shift = self.film(time_features).chunk(2, dim=-1)
+        scale = scale[:, :, None, None]
+        shift = shift[:, :, None, None]
+
+        hidden = self.conv1(self.act(x))
+        hidden = hidden * (1.0 + scale) + shift
+        hidden = self.conv2(self.act(hidden))
+        return x + hidden
 
 
 class TinyTimeConditionedCNN(nn.Module):
-    """A small time-conditioned residual CNN that predicts an RGB velocity field."""
+    """A small time-conditioned residual CNN that predicts an RGB velocity field.
+
+    Time is injected via FiLM (per-block scale/shift) at every residual block instead
+    of a single additive bias at the input, so the network can use time information
+    throughout its depth rather than only before the first block.
+    """
 
     def __init__(
         self,
@@ -37,8 +47,9 @@ class TinyTimeConditionedCNN(nn.Module):
         )
 
         self.input_conv = nn.Conv2d(image_channels, hidden_channels, kernel_size=3, padding=1)
-        self.time_to_channels = nn.Linear(time_dim, hidden_channels)
-        self.blocks = nn.Sequential(*(ResidualConvBlock(hidden_channels) for _ in range(num_blocks)))
+        self.blocks = nn.ModuleList(
+            [FiLMResidualConvBlock(hidden_channels, time_dim) for _ in range(num_blocks)]
+        )
         self.output_conv = nn.Sequential(
             nn.SiLU(),
             nn.Conv2d(hidden_channels, image_channels, kernel_size=3, padding=1),
@@ -51,8 +62,8 @@ class TinyTimeConditionedCNN(nn.Module):
             t = t[:, None]
 
         time_features = self.time_mlp(torch.cat([r, t], dim=1))
-        time_bias = self.time_to_channels(time_features)[:, :, None, None]
 
-        image_features = self.input_conv(z_t)
-        hidden = self.blocks(image_features + time_bias)
+        hidden = self.input_conv(z_t)
+        for block in self.blocks:
+            hidden = block(hidden, time_features)
         return self.output_conv(hidden)
