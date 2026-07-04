@@ -172,6 +172,21 @@ def parse_args():
         "updated every --eval-every steps. Gives a currently-harder-to-fit image more gradient signal "
         "instead of letting well-fit images dominate the averaged loss.",
     )
+    parser.add_argument(
+        "--loss-weight-power",
+        type=float,
+        default=0.0,
+        help="MeanFlow paper's adaptive loss weighting power p (Appendix B.2): weight = "
+        "1/(per_sample_error + loss_weight_c)^p, stop-gradiented. Down-weights samples with an "
+        "unusually large current error (e.g. a noisy JVP estimate) instead of letting them dominate "
+        "plain MSE. Paper uses p=1 for ImageNet, p=0.75 for pixel-space CIFAR-10. Default 0 = plain MSE.",
+    )
+    parser.add_argument(
+        "--loss-weight-c",
+        type=float,
+        default=1e-3,
+        help="Small constant in the adaptive loss weighting denominator, avoids division by zero.",
+    )
     return parser.parse_args()
 
 
@@ -281,7 +296,7 @@ def main() -> None:
     for step in range(1, args.steps + 1):
         batch = make_meanflow_batch(clean_image, args.equal_time_probability, args.endpoint_probability)
         sample_weight = per_image_weight[image_indices] if args.reweight_images else None
-        result = meanflow_loss(model, batch, sample_weight)
+        result = meanflow_loss(model, batch, sample_weight, args.loss_weight_power, args.loss_weight_c)
 
         optimizer.zero_grad(set_to_none=True)
         result.loss.backward()

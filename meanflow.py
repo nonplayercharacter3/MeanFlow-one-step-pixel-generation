@@ -1,7 +1,6 @@
 from dataclasses import dataclass
 
 import torch
-import torch.nn.functional as F
 from torch.func import jvp
 
 
@@ -75,12 +74,24 @@ def make_meanflow_batch(
     )
 
 
-def meanflow_loss(model, batch: MeanFlowBatch, sample_weight: torch.Tensor = None) -> MeanFlowLoss:
+def meanflow_loss(
+    model,
+    batch: MeanFlowBatch,
+    sample_weight: torch.Tensor = None,
+    loss_weight_power: float = 0.0,
+    loss_weight_c: float = 1e-3,
+) -> MeanFlowLoss:
     """Compute MSE(u_theta, stopgrad(v - (t-r) du_theta/dt)).
 
     sample_weight, if given, is a per-batch-element weight (shape (batch,)) applied to the
-    squared error before averaging -- used to give harder-to-fit images more gradient signal
-    when a batch mixes multiple fixed targets (see --reweight-images in train.py).
+    squared error -- used to give harder-to-fit images more gradient signal when a batch mixes
+    multiple fixed targets (see --reweight-images in train.py).
+
+    loss_weight_power (p > 0) applies the adaptive loss weighting from the MeanFlow paper
+    (Appendix B.2): w = 1 / (per-sample squared error + loss_weight_c) ** p, stop-gradiented.
+    This down-weights samples whose current error is unusually large (e.g. from a noisy JVP
+    estimate on an endpoint-biased sample), similar to a Pseudo-Huber loss, instead of letting
+    a few large-error samples dominate the plain-MSE gradient. p=0 (default) is plain MSE.
     """
 
     def model_fn(z_t, r, t):
@@ -97,12 +108,16 @@ def meanflow_loss(model, batch: MeanFlowBatch, sample_weight: torch.Tensor = Non
     target = batch.velocity - time_gap * jvp_term
     target = target.detach()
 
-    if sample_weight is None:
-        loss = F.mse_loss(mean_velocity, target)
-    else:
-        squared_error = (mean_velocity - target) ** 2
-        weight = sample_weight[:, None, None, None]
-        loss = (squared_error * weight).mean()
+    squared_error = (mean_velocity - target) ** 2
+    per_sample_error = squared_error.mean(dim=(1, 2, 3))
+
+    weight = torch.ones_like(per_sample_error)
+    if loss_weight_power > 0:
+        weight = weight * (per_sample_error.detach() + loss_weight_c).pow(-loss_weight_power)
+    if sample_weight is not None:
+        weight = weight * sample_weight
+
+    loss = (per_sample_error * weight).mean()
 
     return MeanFlowLoss(
         loss=loss,
