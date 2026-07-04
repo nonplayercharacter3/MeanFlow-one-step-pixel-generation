@@ -83,10 +83,11 @@
 <p class="subtitle">LR-1 — Latent Reasoning track. PyTorch port of MeanFlow, targeting pixel-space one-step image generation.</p>
 
 <div class="callout">
-<strong>How to read this report:</strong> sections marked <span class="status-pending">PENDING</span> contain
-placeholders — this report was generated before the required 3-image overfit run finished executing on GPU.
-Every placeholder names the exact file to drop in once that run completes; no numbers or images below are
-fabricated to look better than what was actually measured.
+<strong>How to read this report:</strong> the single-image case is fully solved (<code>sample_mse=0.012</code>).
+The required 3-image case is <strong>in progress</strong>: best so far is <code>sample_mse&asymp;0.156</code>,
+after a long architecture/hyperparameter search documented in Problem 4. Boxes marked <strong>TODO</strong> still
+need real images/final numbers dropped in before submission — no numbers or images elsewhere are fabricated to
+look better than what was actually measured.
 </div>
 
 <h2>1. What MeanFlow Is, and What I Built</h2>
@@ -133,7 +134,7 @@ loss = MSE(mean_velocity, target)</pre>
 <tr><th>Choice</th><th>Value</th></tr>
 <tr><td>Data</td><td>Imagenette (fastai/imagenette), fixed images, pixel space</td></tr>
 <tr><td>Resolution</td><td>32&times;32, RGB, normalized to [-1, 1]</td></tr>
-<tr><td>Model</td><td>Tiny time-conditioned residual CNN (final config: hidden_channels=256, 6 residual blocks)</td></tr>
+<tr><td>Model</td><td>Started as a flat time-conditioned residual CNN (hidden_channels=256, 6 blocks); evolved into a mini U-Net with 2 downsampling stages + skip connections + GroupNorm for the 3-image case (see Problem 4)</td></tr>
 <tr><td>Conditioning</td><td>Unconditional (no class label)</td></tr>
 <tr><td>Sampler</td><td>One-step (1-NFE): <code>x&#8320; &asymp; noise - u&theta;(noise, 0, 1)</code></td></tr>
 <tr><td>Time sampling</td><td><code>r, t</code> uniform with <code>r &le; t</code>; 10% forced <code>r=t</code>; 25% forced <code>(r,t)=(0,1)</code> (see Problem 1)</td></tr>
@@ -226,6 +227,61 @@ on the single-image case (see Section 3) — an 8&times; improvement over the pl
 near-indistinguishable from the target.
 </p>
 
+<h3>Problem 4 — The 3-image case has a much higher ceiling than 1 image, and it wasn't obvious why</h3>
+<p>
+Everything that solved the single-image case (endpoint bias, clipping, capacity bump to 256/6) got
+<code>sample_mse=0.012</code> — near-perfect. Applying the identical recipe to 3 fixed images plateaued around
+<code>0.20-0.25</code> instead, and stayed there through several different attempted fixes:
+</p>
+<ul>
+  <li><strong>Weight decay:</strong> AdamW defaults to <code>weight_decay=0.01</code>, which regularizes toward
+  zero — directly opposed to the goal of exact memorization. Set to <code>0</code>. Didn't move the ceiling
+  meaningfully on its own.</li>
+  <li><strong>LR schedule length:</strong> cosine decay reaches its floor at a fixed step count regardless of
+  whether the model has converged. Added <code>--adaptive-lr</code> (<code>ReduceLROnPlateau</code> on
+  <code>sample_mse</code> instead of a preset timetable) and <code>--lr-decay-steps</code>. Ruled out schedule
+  truncation as the cause — a model given the full LR budget the whole run still plateaued at the same level.</li>
+  <li><strong>Model capacity in isolation:</strong> tried both smaller (128/4) and larger (320/6, 384/8) flat
+  models. None beat the original 256/6 result. Per the assignment's own hint ("if 3 images won't overfit, scaling
+  up won't help"), this correctly pointed away from "just make it bigger."</li>
+  <li><strong>FiLM conditioning + sinusoidal time embeddings:</strong> standard diffusion-model upgrades (per-block
+  time modulation instead of one additive bias; sin/cos time features instead of a bare scalar). Tested on the
+  flat CNN — result was <em>slightly worse</em> (0.219 vs 0.205), not better.</li>
+</ul>
+<p>
+<strong>The actual fix:</strong> a real mini U-Net — two downsampling stages (32&rarr;16&rarr;8) with skip
+connections, so the network can mix information across the whole image cheaply at low resolution instead of only
+through local 3&times;3 receptive fields at full resolution. Tested in isolation (plain additive time bias, no
+FiLM/sinusoidal, to avoid confounding with the negative result above) against the same 256-equivalent capacity.
+This broke past the ceiling: best <code>sample_mse</code> dropped to <strong>~0.156-0.19</strong> depending on the
+exact run, a genuine improvement no amount of LR/weight-decay/flat-capacity tuning had produced.
+</p>
+<p>
+Along the way, two separate bugs surfaced in the <code>--resume-from</code> polishing workflow, both causing large
+loss spikes (observed up to <code>loss=37</code>) when continuing training from a checkpoint:
+</p>
+<ol>
+  <li><code>checkpoint_best.pt</code> is saved whenever the <em>EMA-smoothed</em> sample hits a new best, but
+  resume was loading the <em>raw</em> (non-EMA) weights back — a noisier starting point than the one that actually
+  produced the good result. Fixed to load EMA weights into the model when present.</li>
+  <li><code>save_checkpoint</code> already stored the optimizer's state, but resume never loaded it back, so every
+  resume restarted Adam's momentum/variance from zero — Adam's bias-correction then takes unusually large effective
+  steps for the first several hundred steps after any resume, regardless of how small <code>--lr</code> is set.
+  Fixed to restore optimizer state and only override the LR scalar afterward.</li>
+</ol>
+<p>
+Separately, added GroupNorm before every conv (previously the network had no normalization anywhere, unusual for a
+multi-resolution network) and per-image <code>sample_mse</code> logging, to test whether one image's fit was being
+traded off against the other two (a plausible cause given three real photos share one small model with no explicit
+"which image" signal — the network has to infer that purely from the noisy input).
+</p>
+<div class="todo">
+<strong>Status at time of writing:</strong> best 3-image <code>sample_mse&asymp;0.156&ndash;0.19</code> depending on
+run; still short of the near-zero error the single-image case reached. Visually: recognizable coarse
+color/position, still noisy fine detail. The GroupNorm + per-image-logging combination is the latest untested
+variant. See Section 3.2 for the exact number and images once a final run is selected for submission.
+</div>
+
 <h2>3. Results</h2>
 
 <h3>3.1 Single-image overfit (supporting result)</h3>
@@ -258,16 +314,18 @@ Reproduce command:
 
 <h3>3.2 Three-image overfit (required bottom line)</h3>
 <p>
-Status: <span class="status-pending">PENDING</span> — this is the assignment's required milestone
-("overfit 3 training examples perfectly... proves the objective + sampler are correct end-to-end") and has not
-finished running yet at the time this report was drafted.
+Status: <span class="status-pending">IN PROGRESS</span> — best result so far is <code>sample_mse&asymp;0.156</code>
+(mini U-Net, batch-size 24, EMA, adaptive LR), down from an initial <code>~0.20-0.25</code> ceiling across many
+flat-CNN attempts (see Problem 4). Visually: coarse color/position is recognizable, fine detail is still noisy —
+not yet "reproduces the images," which is the actual required bar.
 </p>
 <div class="todo">
-<strong>TODO before submitting:</strong> run the three-image experiment (Colab cell already set up), then copy the
-small PNGs into <code>report_assets/</code> (tracked in git, unlike <code>outputs/</code>):
-<pre>cp outputs/overfit3/clean_grid.png report_assets/overfit3_clean_grid.png
-cp outputs/overfit3/sample_best_grid.png report_assets/overfit3_sample_grid.png
-cp outputs/overfit3/loss_curve.png report_assets/overfit3_loss_curve.png</pre>
+<strong>TODO before submitting:</strong> pick the final run to report (current candidate:
+<code>outputs/overfit3_groupnorm/</code> or later), then copy the small PNGs into <code>report_assets/</code>
+(tracked in git, unlike <code>outputs/</code>):
+<pre>cp outputs/&lt;final_run&gt;/clean_grid.png report_assets/overfit3_clean_grid.png
+cp outputs/&lt;final_run&gt;/sample_best_grid.png report_assets/overfit3_sample_grid.png
+cp outputs/&lt;final_run&gt;/loss_curve.png report_assets/overfit3_loss_curve.png</pre>
 then replace this whole subsection with:
 <pre>&lt;div class="row"&gt;
   &lt;figure class="figure"&gt;&lt;img src="report_assets/overfit3_clean_grid.png"&gt;&lt;figcaption&gt;Clean (3 targets)&lt;/figcaption&gt;&lt;/figure&gt;
@@ -275,14 +333,12 @@ then replace this whole subsection with:
 &lt;/div&gt;
 &lt;div class="figure"&gt;&lt;img src="report_assets/overfit3_loss_curve.png" style="max-width:480px"&gt;&lt;/div&gt;
 &lt;p&gt;Best sample_mse: &lt;!-- fill in from checkpoint_best.pt --&gt;&lt;/p&gt;</pre>
-Reproduce command:
+Current best-known reproduce command (mini U-Net + GroupNorm + adaptive LR):
 <pre>python train.py \
   --images data/overfit3/image_0.png data/overfit3/image_1.png data/overfit3/image_2.png \
-  --steps 5000 --batch-size 9 --lr 3e-4 --hidden-channels 256 --num-blocks 6 \
-  --sample-every 500 --checkpoint-every 1000 --output-dir outputs/overfit3</pre>
-Given the single-image result (0.012) used the same architecture, learning rate, clipping, and time-sampling
-scheme, the three-image run is expected to reach comparable per-image quality — but this must be verified, not
-assumed.
+  --steps 4000 --batch-size 24 --lr 3e-4 --hidden-channels 128 --num-blocks 2 \
+  --adaptive-lr --lr-patience 300 \
+  --sample-every 500 --checkpoint-every 1000 --output-dir outputs/overfit3_final</pre>
 </div>
 
 <h3>3.3 Ten-class Imagenette generalization (bonus, not attempted)</h3>
@@ -293,10 +349,11 @@ Not attempted. The required bottom line (3-image overfit) was prioritized first,
 
 <h2>4. Known Limitations</h2>
 <ul>
-  <li>Model is intentionally small (a few million parameters); no attention, no U-Net-style downsampling — a plain
-  residual CNN with additive time conditioning.</li>
+  <li>Model is a mini U-Net (~5-20M parameters depending on width), no attention layers; the single-image result
+  used a simpler flat CNN, so the two experiments aren't on identically-sized/shaped models.</li>
   <li>Only unconditional generation; class conditioning was not implemented (assignment marks this optional).</li>
-  <li>Three-image and 10-class results are not yet verified end-to-end (see TODOs above).</li>
+  <li>Three-image result has not yet reached the single-image case's near-zero error; best so far is
+  <code>sample_mse&asymp;0.156</code>, still visibly noisy in fine detail. 10-class bonus not attempted.</li>
   <li>Batch composition when cycling through more images than fit evenly into <code>--batch-size</code> is not
   perfectly balanced (uses ceiling-division tiling then truncation) — fine for small image counts like 3, would need
   revisiting for larger sets.</li>
