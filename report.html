@@ -83,11 +83,13 @@
 <p class="subtitle">LR-1 — Latent Reasoning track. PyTorch port of MeanFlow, targeting pixel-space one-step image generation.</p>
 
 <div class="callout">
-<strong>How to read this report:</strong> the single-image case is fully solved (<code>sample_mse=0.012</code>).
-The required 3-image case is <strong>in progress</strong>: best so far is <code>sample_mse&asymp;0.156</code>,
-after a long architecture/hyperparameter search documented in Problem 4. Boxes marked <strong>TODO</strong> still
-need real images/final numbers dropped in before submission — no numbers or images elsewhere are fabricated to
-look better than what was actually measured.
+<strong>How to read this report:</strong> both expectations from the assignment's required tier are
+<span class="status-done">reached</span>. Single-image overfit: <code>sample_mse=0.012</code>. The required
+3-image overfit: mean nearest-image <code>sample_mse=0.0094</code> (per image: 0.0021 / 0.0050 / 0.0053) —
+one-step samples are visually indistinguishable copies of the training images, confirmed on held-out noise the
+model was never evaluated on during training. The debugging journey, including two cases where the
+<em>measurement itself</em> was the bug (Problems 5&ndash;6), is documented in Section 2. No numbers or images
+are fabricated to look better than what was actually measured.
 </div>
 
 <h2>1. What MeanFlow Is, and What I Built</h2>
@@ -134,10 +136,12 @@ loss = MSE(mean_velocity, target)</pre>
 <tr><th>Choice</th><th>Value</th></tr>
 <tr><td>Data</td><td>Imagenette (fastai/imagenette), fixed images, pixel space</td></tr>
 <tr><td>Resolution</td><td>32&times;32, RGB, normalized to [-1, 1]</td></tr>
-<tr><td>Model</td><td>Started as a flat time-conditioned residual CNN (hidden_channels=256, 6 blocks); evolved into a mini U-Net with 2 downsampling stages + skip connections + GroupNorm for the 3-image case (see Problem 4)</td></tr>
+<tr><td>Model</td><td>Started as a flat time-conditioned residual CNN (hidden_channels=256, 6 blocks); final model is a mini U-Net (2 downsampling stages, skip connections, GroupNorm, self-attention at the 8&times;8 bottleneck) with sinusoidal embeddings of <code>(t, t-r)</code> injected into every residual block via FiLM — 21M parameters at <code>hidden_channels=128, num_blocks=2</code> (see Problems 4&ndash;5)</td></tr>
 <tr><td>Conditioning</td><td>Unconditional (no class label)</td></tr>
 <tr><td>Sampler</td><td>One-step (1-NFE): <code>x&#8320; &asymp; noise - u&theta;(noise, 0, 1)</code></td></tr>
-<tr><td>Time sampling</td><td><code>r, t</code> uniform with <code>r &le; t</code>; 10% forced <code>r=t</code>; 25% forced <code>(r,t)=(0,1)</code> (see Problem 1)</td></tr>
+<tr><td>Time sampling</td><td>Final: logit-normal <code>sigmoid(N(-0.4, 1.0))</code> per the paper, sorted so <code>r &le; t</code>; 50% forced <code>r=t</code> (plain flow matching); 10% forced <code>(r,t)=(0,1)</code> (see Problems 1, 5)</td></tr>
+<tr><td>Loss</td><td>MSE with the paper's adaptive weighting (Appendix B.2), <code>p=0.75, c=1e-3</code>, stop-gradiented (see Problem 5)</td></tr>
+<tr><td>Evaluation</td><td>Assignment-free: 8 fixed noises, each one-step sample scored against its <em>nearest</em> training image; each image scored by its best reproduction (see Problem 6)</td></tr>
 </table>
 
 <h2>2. Problems Hit and How They Were Solved</h2>
@@ -246,7 +250,8 @@ Everything that solved the single-image case (endpoint bias, clipping, capacity 
   up won't help"), this correctly pointed away from "just make it bigger."</li>
   <li><strong>FiLM conditioning + sinusoidal time embeddings:</strong> standard diffusion-model upgrades (per-block
   time modulation instead of one additive bias; sin/cos time features instead of a bare scalar). Tested on the
-  flat CNN — result was <em>slightly worse</em> (0.219 vs 0.205), not better.</li>
+  flat CNN — result was <em>slightly worse</em> (0.219 vs 0.205), not better. (This negative result turned out to
+  be specific to the flat CNN: the same two upgrades applied to the U-Net were decisive — see Problem 5.)</li>
 </ul>
 <p>
 <strong>The actual fix:</strong> a real mini U-Net — two downsampling stages (32&rarr;16&rarr;8) with skip
@@ -275,12 +280,72 @@ multi-resolution network) and per-image <code>sample_mse</code> logging, to test
 traded off against the other two (a plausible cause given three real photos share one small model with no explicit
 "which image" signal — the network has to infer that purely from the noisy input).
 </p>
-<div class="todo">
-<strong>Status at time of writing:</strong> best 3-image <code>sample_mse&asymp;0.156&ndash;0.19</code> depending on
-run; still short of the near-zero error the single-image case reached. Visually: recognizable coarse
-color/position, still noisy fine detail. The GroupNorm + per-image-logging combination is the latest untested
-variant. See Section 3.2 for the exact number and images once a final run is selected for submission.
-</div>
+<p>
+The U-Net + GroupNorm + bottleneck-attention stack landed at <code>sample_mse&asymp;0.126&ndash;0.156</code> —
+past the flat-CNN ceiling, but still visibly noisy. Two more problems stood between that and the final result.
+</p>
+
+<h3>Problem 5 — The U-Net plateaus at ~0.13: three compounding causes</h3>
+<p>
+The isolation experiment in Problem 4 had deliberately kept the U-Net's time conditioning primitive (raw scalar
+<code>(r, t)</code> &rarr; MLP &rarr; a single additive bias after the input conv) so that the U-Net structure was
+the only new variable. With that experiment concluded, the crippled conditioning itself became the prime suspect,
+alongside two training-loop issues:
+</p>
+<ul>
+  <li><strong>Time conditioning:</strong> the MeanFlow target contains <code>du/dt</code> — the JVP differentiates
+  the network w.r.t. <code>t</code>. With time entering only as one input-level bias, <code>&part;u/&part;t</code>
+  is structurally almost constant across depth: the network lacks the machinery to represent how the average
+  velocity changes with the time gap. Fix: sinusoidal embeddings of <code>t</code> and <code>t-r</code> (the two
+  quantities the target actually depends on) &rarr; MLP &rarr; per-block FiLM scale/shift, zero-initialized so each
+  block starts at its previous time-independent behavior. The same upgrades that had failed on the flat CNN
+  (Problem 4) were decisive here: the paired metric fell to 0.135 by step <em>300</em> — a level the previous
+  architecture needed 3400+ steps to approach — and one image reached 0.005.</li>
+  <li><strong>Loss variance:</strong> the raw training loss oscillated across two orders of magnitude (0.3&ndash;30)
+  and trended <em>up</em> while sample quality improved — endpoint samples with <code>t-r=1</code> carry the
+  noisiest full-strength JVP targets and dominated plain MSE. Fix: the paper's adaptive loss weighting
+  (<code>w = 1/(err + c)^p</code>, stop-gradiented, <code>p=0.75</code>), plus the paper's logit-normal time
+  distribution, a 50% <code>r==t</code> fraction (the paper's ablation favors mostly plain flow matching, the
+  opposite of the 90% <code>r&ne;t</code> used before), and the endpoint bias cut from 25% to 10%.</li>
+  <li><strong>Two measurement-cadence bugs:</strong> (a) <code>ReduceLROnPlateau</code> counts patience in
+  <code>step()</code> <em>calls</em>, but it was only called on eval steps (every ~10 training steps), making the
+  effective patience 10&times; longer than documented — the LR never dropped in a 4000-step run. Fixed by
+  converting the user-facing training-step patience into eval-call units. (b) With <code>--ema-decay 0.999</code>
+  the eval weights average over ~1000 steps; in a run whose whole interesting phase <em>is</em> ~1000 steps, every
+  reported number lagged the real model badly. Switched to 0.99 for short runs.</li>
+</ul>
+<p>
+After these fixes the model learned dramatically faster — but the paired per-image metric showed a new mystery:
+one image converged to 0.005 while the other two sat at 0.21/0.25 and slowly <em>rose</em>, even as the LR annealed
+correctly all the way to 8e-6. More optimization provably could not move them. That contradiction is Problem 6.
+</p>
+
+<h3>Problem 6 — The metric was wrong, not the model: noise&rarr;image pairing is not ours to choose</h3>
+<p>
+The evaluation had always paired <code>fixed_noise[i]</code> with <code>image[i]</code> and reported per-image
+reconstruction MSE. But nothing in the MeanFlow objective enforces that pairing: the learned marginal flow picks
+its <em>own</em> noise&rarr;image assignment (each image owns a basin of noise space, and the flow map sends each
+noise to the image whose basin it falls in). Training with fresh noise every step means the model never even sees
+the fixed eval noises. One eval noise happened to sit deep inside "its" image's basin (&rarr; 0.005); the other two
+sat in the wrong basins or near boundaries — so their paired error <em>rose as the model sharpened</em>, precisely
+because the model was getting better at being the true flow.
+</p>
+<p>
+<strong>Diagnosis:</strong> a new script (<code>sample.py</code>) samples 16 <em>fresh</em> noises (different seed
+from training) and scores each one-step sample against its <em>nearest</em> training image, plus coverage — is
+every image produced by at least one noise? On the very checkpoint whose paired metric claimed
+<code>img1=0.215</code>, the assignment-free view showed every sample landing cleanly on a training image, all
+three images covered, and img1 reproduced at <code>mse=0.0011</code>. The model had been essentially correct for
+some time; the metric was asking it to honor an arbitrary pairing it had rightly discarded.
+</p>
+<p>
+<strong>Fix:</strong> the trainer's eval is now assignment-free — 8 fixed noises, <code>sample_mse</code> = mean
+MSE to each sample's nearest image (are all samples clean copies of <em>something</em>?), per-image MSE = each
+image's best reproduction across the noises (is every image covered?). This mattered beyond reporting: best-checkpoint
+selection, the plateau LR scheduler, and per-image loss reweighting had all been steering on the misleading paired
+signal — the "best" checkpoint it kept was in fact the worse model. With the honest metric, the final run converged
+to mean nearest-image <code>sample_mse=0.0094</code> (per image 0.0021 / 0.0050 / 0.0053) by step 900.
+</p>
 
 <h2>3. Results</h2>
 
@@ -314,31 +379,54 @@ Reproduce command:
 
 <h3>3.2 Three-image overfit (required bottom line)</h3>
 <p>
-Status: <span class="status-pending">IN PROGRESS</span> — best result so far is <code>sample_mse&asymp;0.156</code>
-(mini U-Net, batch-size 24, EMA, adaptive LR), down from an initial <code>~0.20-0.25</code> ceiling across many
-flat-CNN attempts (see Problem 4). Visually: coarse color/position is recognizable, fine detail is still noisy —
-not yet "reproduces the images," which is the actual required bar.
+Status: <span class="status-done">reached</span> — mean nearest-image <code>sample_mse = 0.0094</code> at step 900
+(per image: <code>0.0021 / 0.0050 / 0.0053</code>), i.e. ~1&ndash;2% per-pixel RMSE in [-1,1] space. One-step
+samples are visually indistinguishable copies of the three training images. Confirmed two ways: on the 8 fixed eval
+noises used during training, and on 16 fresh noises from a different seed (<code>sample.py</code>) — every held-out
+sample lands cleanly on a training image and all three images are covered.
 </p>
-<div class="todo">
-<strong>TODO before submitting:</strong> pick the final run to report (current candidate:
-<code>outputs/overfit3_groupnorm/</code> or later), then copy the small PNGs into <code>report_assets/</code>
-(tracked in git, unlike <code>outputs/</code>):
-<pre>cp outputs/&lt;final_run&gt;/clean_grid.png report_assets/overfit3_clean_grid.png
-cp outputs/&lt;final_run&gt;/sample_best_grid.png report_assets/overfit3_sample_grid.png
-cp outputs/&lt;final_run&gt;/loss_curve.png report_assets/overfit3_loss_curve.png</pre>
-then replace this whole subsection with:
-<pre>&lt;div class="row"&gt;
-  &lt;figure class="figure"&gt;&lt;img src="report_assets/overfit3_clean_grid.png"&gt;&lt;figcaption&gt;Clean (3 targets)&lt;/figcaption&gt;&lt;/figure&gt;
-  &lt;figure class="figure"&gt;&lt;img src="report_assets/overfit3_sample_grid.png"&gt;&lt;figcaption&gt;Best one-step samples&lt;/figcaption&gt;&lt;/figure&gt;
-&lt;/div&gt;
-&lt;div class="figure"&gt;&lt;img src="report_assets/overfit3_loss_curve.png" style="max-width:480px"&gt;&lt;/div&gt;
-&lt;p&gt;Best sample_mse: &lt;!-- fill in from checkpoint_best.pt --&gt;&lt;/p&gt;</pre>
-Current best-known reproduce command (mini U-Net + GroupNorm + adaptive LR):
+<div class="row">
+  <figure class="figure">
+    <img src="report_assets/overfit3_clean_grid.png" alt="the 3 clean training images" />
+    <figcaption>The 3 training images (32&times;32 Imagenette crops)</figcaption>
+  </figure>
+  <figure class="figure">
+    <img src="report_assets/overfit3_sample_grid.png" alt="best one-step samples from 8 fixed noises" />
+    <figcaption>One-step samples from the 8 fixed eval noises, sorted by nearest image</figcaption>
+  </figure>
+</div>
+<div class="figure">
+  <img src="report_assets/overfit3_heldout_grid.png" alt="one-step samples from 16 held-out noises" />
+  <figcaption>One-step samples from 16 held-out noises (seed never used in training), sorted by nearest image —
+  all clean copies, all three images covered</figcaption>
+</div>
+<div class="figure">
+  <img src="report_assets/overfit3_loss_curve.png" alt="final run loss curve" style="max-width:480px" />
+  <figcaption>Final run: training loss and assignment-free sample_mse (solid), per-image best reproduction
+  (dashed), log scale</figcaption>
+</div>
+<p>Reproduce command (~10 min on a Colab L4):</p>
 <pre>python train.py \
   --images data/overfit3/image_0.png data/overfit3/image_1.png data/overfit3/image_2.png \
-  --steps 4000 --batch-size 24 --lr 3e-4 --hidden-channels 128 --num-blocks 2 \
-  --adaptive-lr --lr-patience 300 \
-  --sample-every 500 --checkpoint-every 1000 --output-dir outputs/overfit3_final</pre>
+  --steps 2500 --batch-size 64 --lr 5e-4 --hidden-channels 128 --num-blocks 2 \
+  --time-sampling logit_normal --equal-time-probability 0.5 --endpoint-probability 0.1 \
+  --loss-weight-power 0.75 --adaptive-lr --lr-patience 150 --ema-decay 0.99 --reweight-images \
+  --sample-every 500 --checkpoint-every 1000 --output-dir outputs/overfit3_final
+
+python sample.py \
+  --checkpoint outputs/overfit3_final/checkpoint_best.pt \
+  --images data/overfit3/image_0.png data/overfit3/image_1.png data/overfit3/image_2.png \
+  --num-samples 16</pre>
+<div class="todo">
+<strong>TODO before submitting:</strong> the final run lives in the Colab session. Download these four PNGs from
+<code>outputs/overfit3_final/</code> into <code>report_assets/</code> (tracked in git, unlike <code>outputs/</code>):
+<pre>clean_grid.png          &rarr; report_assets/overfit3_clean_grid.png
+sample_best_grid.png    &rarr; report_assets/overfit3_sample_grid.png
+samples_many_noises.png &rarr; report_assets/overfit3_heldout_grid.png
+loss_curve_clean.png    &rarr; report_assets/overfit3_loss_curve.png</pre>
+(<code>loss_curve_clean.png</code> is the replotted curve filtered to the final run's rows; the auto-saved
+<code>loss_curve.png</code> in that dir mixes rows from an earlier run into the same CSV — see the fix in
+<code>train.py</code>, which now truncates the CSV at startup.)
 </div>
 
 <h3>3.3 Ten-class Imagenette generalization (bonus, not attempted)</h3>
@@ -349,11 +437,13 @@ Not attempted. The required bottom line (3-image overfit) was prioritized first,
 
 <h2>4. Known Limitations</h2>
 <ul>
-  <li>Model is a mini U-Net (~5-20M parameters depending on width), no attention layers; the single-image result
-  used a simpler flat CNN, so the two experiments aren't on identically-sized/shaped models.</li>
+  <li>The single-image result used the earlier flat CNN and the 3-image result the final U-Net, so the two headline
+  numbers aren't on identically-shaped models.</li>
   <li>Only unconditional generation; class conditioning was not implemented (assignment marks this optional).</li>
-  <li>Three-image result has not yet reached the single-image case's near-zero error; best so far is
-  <code>sample_mse&asymp;0.156</code>, still visibly noisy in fine detail. 10-class bonus not attempted.</li>
+  <li>Basin coverage is imbalanced: with fresh random noises, roughly 10&ndash;12 of 16 one-step samples land on
+  the same training image. Nothing in the unconditional objective demands balanced basins, and all three images are
+  reliably covered, but a generator with equal 1/3 assignment probability would need explicit conditioning.</li>
+  <li>10-class Imagenette bonus not attempted (see 3.3).</li>
   <li>Batch composition when cycling through more images than fit evenly into <code>--batch-size</code> is not
   perfectly balanced (uses ceiling-division tiling then truncation) — fine for small image counts like 3, would need
   revisiting for larger sets.</li>

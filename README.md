@@ -22,35 +22,33 @@ The required milestone is to overfit three fixed training images and reproduce t
 
 ## Current Status
 
+**The required milestone is reached**: the 3-image overfit converges to mean nearest-image `sample_mse = 0.0094` (per image: 0.0021 / 0.0050 / 0.0053) in ~900 steps, and one-step samples from held-out noise are visually indistinguishable copies of the training images. See `report.html` for the full debugging journey.
+
 Implemented:
 
 * image loading and normalization;
 * linear interpolation between image and noise;
-* MeanFlow target construction;
-* JVP computation with `torch.func.jvp`;
-* detached MeanFlow target;
-* tiny time-conditioned CNN;
+* MeanFlow target construction with `torch.func.jvp` and a detached target;
+* the paper's adaptive loss weighting (`--loss-weight-power`) and logit-normal time sampling (`--time-sampling logit_normal`);
+* mini U-Net with sinusoidal `(t, t-r)` embeddings, per-block FiLM conditioning, GroupNorm, and bottleneck self-attention;
 * one-step sampler;
-* analytical JVP test;
-* gradient and numerical sanity checks;
-* checkpoint and sample saving.
-
-Current experiment:
-
-* one fixed `32 x 32` Imagenette image;
-* CPU development test;
-* one-step reconstruction still being debugged.
+* EMA weights for evaluation, adaptive LR (`ReduceLROnPlateau` on sample quality), gradient clipping;
+* assignment-free evaluation: samples are scored against their *nearest* training image, since MeanFlow's marginal flow chooses its own noise-to-image assignment;
+* `sample.py` for held-out-noise evaluation of a trained checkpoint;
+* analytical JVP test, gradient and numerical sanity checks, checkpoint and sample saving.
 
 ## Repository Structure
 
 ```text
 MeanFlow/
 ├── train.py          # Training entry point
-├── model.py          # Tiny time-conditioned CNN
+├── sample.py         # Held-out-noise evaluation of a trained checkpoint
+├── model.py          # Mini U-Net with FiLM time conditioning
 ├── meanflow.py       # MeanFlow objective, JVP, and sampler
 ├── utils.py          # Image loading and output utilities
 ├── README.md
-├── EXPERIMENTS.md    # Chronological experiment log
+├── Experiments.md    # Chronological experiment log
+├── report.html       # Assignment report
 ├── data/
 └── outputs/
 ```
@@ -73,9 +71,9 @@ For the final experiment, an NVIDIA GPU is recommended. The code can run on CPU 
 
 ## Data
 
-The current debugging experiment uses one fixed image from Imagenette.
+The overfit experiments use fixed images from Imagenette (`data/overfit1/`, `data/overfit3/`).
 
-The image is:
+Each image is:
 
 * converted to RGB;
 * resized to `32 x 32`;
@@ -87,7 +85,7 @@ The full assignment target uses either Imagenette or another fixed 10-class Imag
 ## Run a Syntax Check
 
 ```bash
-python -m py_compile train.py model.py meanflow.py utils.py
+python -m py_compile train.py sample.py model.py meanflow.py utils.py
 ```
 
 ## Run a Short Smoke Test
@@ -129,20 +127,43 @@ The same clean image is repeated across the batch, but every batch element recei
 
 ## Run the Three-Image Overfit Experiment (required milestone)
 
+This is the final recipe (~10 minutes on a Colab L4, reaches `sample_mse ≈ 0.009`):
+
 ```bash
 python train.py \
   --images data/overfit3/image_0.png data/overfit3/image_1.png data/overfit3/image_2.png \
-  --steps 5000 \
-  --batch-size 9 \
-  --lr 3e-4 \
-  --hidden-channels 256 \
-  --num-blocks 6 \
+  --steps 2500 \
+  --batch-size 64 \
+  --lr 5e-4 \
+  --hidden-channels 128 \
+  --num-blocks 2 \
+  --time-sampling logit_normal \
+  --equal-time-probability 0.5 \
+  --endpoint-probability 0.1 \
+  --loss-weight-power 0.75 \
+  --adaptive-lr \
+  --lr-patience 150 \
+  --ema-decay 0.99 \
+  --reweight-images \
   --sample-every 500 \
   --checkpoint-every 1000 \
-  --output-dir outputs/overfit3
+  --output-dir outputs/overfit3_final
 ```
 
-`--images` accepts any number of paths; the batch is filled by cycling through them. Per-image clean/sample files are saved as `clean_0.png`, `clean_1.png`, ... and `sample_best_0.png`, `sample_best_1.png`, ..., alongside `clean_grid.png` / `sample_best_grid.png` contact sheets showing all images side by side. `sample_mse` is the mean reconstruction error averaged across all images.
+`--images` accepts any number of paths; the batch is filled by cycling through them.
+
+Evaluation is assignment-free: MeanFlow's learned marginal flow chooses its own noise-to-image mapping, so pairing a fixed noise with a fixed image would report spurious errors. Instead, each of 8 fixed eval noises is scored against its *nearest* training image (`sample_mse`), and each image is scored by its best reproduction across the noises (the per-image `img0=...` numbers in the log and CSV). Outputs include `clean_grid.png`, `sample_best_grid.png` (samples sorted by nearest image), per-image `clean_{i}.png` / `sample_best_{i}.png` pairs, `loss_history.csv`, and `loss_curve.png`.
+
+## Evaluate a Checkpoint on Held-Out Noise
+
+```bash
+python sample.py \
+  --checkpoint outputs/overfit3_final/checkpoint_best.pt \
+  --images data/overfit3/image_0.png data/overfit3/image_1.png data/overfit3/image_2.png \
+  --num-samples 16
+```
+
+Samples 16 fresh noises (a seed never used in training), prints each sample's nearest training image and MSE plus per-image coverage, and saves `samples_many_noises.png` sorted by nearest image. This is the confirmation that the model reproduces all three images from noise it has never been evaluated on.
 
 ## Training Procedure
 
@@ -198,18 +219,21 @@ Generated samples are saved periodically in the selected output directory.
 
 ## Outputs
 
-Each experiment directory may contain:
+Each experiment directory contains:
 
 ```text
 outputs/experiment_name/
-├── sample_step_0500.png
-├── sample_step_1000.png
-├── checkpoint_step_1000.pt
-├── training.log
-└── loss_curve.png
+├── clean_grid.png            # the training images side by side
+├── clean_{i}.png             # each training image
+├── sample_best_grid.png      # best one-step samples, sorted by nearest image
+├── sample_best_{i}.png       # best reproduction of image i
+├── sample_step_{n}.png       # periodic sample grids
+├── samples_many_noises.png   # written by sample.py
+├── checkpoint.pt             # periodic checkpoint (model, EMA, optimizer, args)
+├── checkpoint_best.pt        # checkpoint at the best sample_mse
+├── loss_history.csv          # per-eval loss, sample_mse, per-image mse
+└── loss_curve.png            # plotted at the end of training
 ```
-
-Exact filenames may differ depending on the current implementation.
 
 ## Reproducibility
 
@@ -226,26 +250,14 @@ For each experiment, record:
 * probability of `r == t`;
 * device used.
 
-Detailed experiment notes are stored in `EXPERIMENTS.md`.
+Detailed experiment notes are stored in `Experiments.md`; the debugging narrative is in `report.html`.
 
 ## Known Limitations
 
-* The current model is intentionally very small.
-* The current debugging setup uses one image rather than the final three-image dataset.
-* CPU training is slow.
-* A decreasing loss does not by itself prove successful one-step generation.
-* The final correctness test is whether generated samples reproduce the fixed training images.
-
-## Final Target
-
-The required final result is:
-
-* train on three fixed images;
-* overfit them successfully;
-* generate recognizable reconstructions in one model evaluation;
-* report the loss curve and generated samples.
-
-The optional extension is training on a 10-class Imagenette subset.
+* Unconditional only; basin coverage across the 3 images is imbalanced (most random noises map to one image, though all three are reliably produced).
+* CPU training is slow; the final recipe assumes a GPU.
+* A decreasing loss does not by itself prove successful one-step generation — hence the assignment-free `sample_mse` and `sample.py` held-out check.
+* The optional 10-class Imagenette extension was not attempted.
 
 ## References
 
