@@ -165,6 +165,13 @@ def parse_args():
         "The sample forward pass + EMA copy is a full extra model evaluation on top of the JVP training "
         "step, so skipping it on most steps meaningfully speeds up training.",
     )
+    parser.add_argument(
+        "--reweight-images",
+        action="store_true",
+        help="Weight each image's contribution to the loss by (its sample_mse / mean sample_mse), "
+        "updated every --eval-every steps. Gives a currently-harder-to-fit image more gradient signal "
+        "instead of letting well-fit images dominate the averaged loss.",
+    )
     return parser.parse_args()
 
 
@@ -268,9 +275,13 @@ def main() -> None:
     loss_csv = output_dir / "loss_history.csv"
     best_sample_mse = float("inf")
 
+    image_indices = torch.arange(args.batch_size, device=device) % num_images
+    per_image_weight = torch.ones(num_images, device=device)
+
     for step in range(1, args.steps + 1):
         batch = make_meanflow_batch(clean_image, args.equal_time_probability, args.endpoint_probability)
-        result = meanflow_loss(model, batch)
+        sample_weight = per_image_weight[image_indices] if args.reweight_images else None
+        result = meanflow_loss(model, batch, sample_weight)
 
         optimizer.zero_grad(set_to_none=True)
         result.loss.backward()
@@ -302,6 +313,12 @@ def main() -> None:
                     sample = one_step_sample(model, fixed_eval_noise)
                 sample_mse = F.mse_loss(sample, base_images).item()
                 per_image_mse = F.mse_loss(sample, base_images, reduction="none").mean(dim=(1, 2, 3)).tolist()
+
+            if args.reweight_images:
+                per_image_mse_tensor = torch.tensor(per_image_mse, device=device)
+                per_image_weight = (per_image_mse_tensor / per_image_mse_tensor.mean().clamp_min(1e-8)).clamp(
+                    0.2, 5.0
+                )
 
             if plateau_scheduler is not None:
                 plateau_scheduler.step(sample_mse)

@@ -75,8 +75,13 @@ def make_meanflow_batch(
     )
 
 
-def meanflow_loss(model, batch: MeanFlowBatch) -> MeanFlowLoss:
-    """Compute MSE(u_theta, stopgrad(v - (t-r) du_theta/dt))."""
+def meanflow_loss(model, batch: MeanFlowBatch, sample_weight: torch.Tensor = None) -> MeanFlowLoss:
+    """Compute MSE(u_theta, stopgrad(v - (t-r) du_theta/dt)).
+
+    sample_weight, if given, is a per-batch-element weight (shape (batch,)) applied to the
+    squared error before averaging -- used to give harder-to-fit images more gradient signal
+    when a batch mixes multiple fixed targets (see --reweight-images in train.py).
+    """
 
     def model_fn(z_t, r, t):
         return model(z_t, r, t)
@@ -91,7 +96,13 @@ def meanflow_loss(model, batch: MeanFlowBatch) -> MeanFlowLoss:
     time_gap = (batch.t - batch.r)[:, :, None, None]
     target = batch.velocity - time_gap * jvp_term
     target = target.detach()
-    loss = F.mse_loss(mean_velocity, target)
+
+    if sample_weight is None:
+        loss = F.mse_loss(mean_velocity, target)
+    else:
+        squared_error = (mean_velocity - target) ** 2
+        weight = sample_weight[:, None, None, None]
+        loss = (squared_error * weight).mean()
 
     return MeanFlowLoss(
         loss=loss,
