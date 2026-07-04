@@ -134,6 +134,24 @@ def parse_args():
         "--steps to decay more slowly (training ends before the schedule bottoms out).",
     )
     parser.add_argument(
+        "--adaptive-lr",
+        action="store_true",
+        help="Use ReduceLROnPlateau on sample_mse instead of a fixed schedule. Overrides --no-lr-decay "
+        "and --lr-decay-steps: the LR only drops when sample_mse actually stalls, instead of on a preset timetable.",
+    )
+    parser.add_argument(
+        "--lr-patience",
+        type=int,
+        default=200,
+        help="Steps with no sample_mse improvement before --adaptive-lr cuts the LR.",
+    )
+    parser.add_argument(
+        "--lr-factor",
+        type=float,
+        default=0.5,
+        help="Multiply LR by this factor when --adaptive-lr detects a plateau.",
+    )
+    parser.add_argument(
         "--ema-decay",
         type=float,
         default=0.999,
@@ -202,13 +220,18 @@ def main() -> None:
         for parameter in eval_model.parameters():
             parameter.requires_grad_(False)
 
-    scheduler = (
-        None
-        if args.no_lr_decay
-        else torch.optim.lr_scheduler.CosineAnnealingLR(
+    plateau_scheduler = None
+    if args.adaptive_lr:
+        plateau_scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer, mode="min", factor=args.lr_factor, patience=args.lr_patience
+        )
+        scheduler = None
+    elif args.no_lr_decay:
+        scheduler = None
+    else:
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
             optimizer, T_max=args.lr_decay_steps or args.steps, eta_min=args.lr * 0.01
         )
-    )
 
     run_sanity_checks(model, optimizer, clean_image)
 
@@ -244,6 +267,9 @@ def main() -> None:
                 sample = one_step_sample(model, fixed_eval_noise)
             sample_mse = F.mse_loss(sample, base_images).item()
 
+        if plateau_scheduler is not None:
+            plateau_scheduler.step(sample_mse)
+
         loss_value = result.loss.item()
         append_loss_csv(str(loss_csv), step, loss_value, sample_mse)
 
@@ -264,7 +290,7 @@ def main() -> None:
                 result.loss,
                 sample,
             )
-            current_lr = scheduler.get_last_lr()[0] if scheduler is not None else optimizer.param_groups[0]["lr"]
+            current_lr = optimizer.param_groups[0]["lr"]
             print(
                 f"step={step:04d}",
                 f"lr={current_lr:.6f}",
