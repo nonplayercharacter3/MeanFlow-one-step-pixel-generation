@@ -35,6 +35,46 @@ class ResidualConvBlock(nn.Module):
         return x + self.net(x)
 
 
+def attention_heads(channels: int, max_heads: int = 8) -> int:
+    """Largest head count <= max_heads that evenly divides channels."""
+    for heads in range(min(max_heads, channels), 0, -1):
+        if channels % heads == 0:
+            return heads
+    return 1
+
+
+class SelfAttention2D(nn.Module):
+    """Global self-attention over spatial positions, meant for a low-resolution bottleneck.
+
+    Local 3x3 convolutions only ever compare a pixel to its immediate neighbors, so the
+    network has no mechanism to compare the noisy input's overall pattern against itself
+    globally. At an 8x8 bottleneck (64 tokens) this is cheap, unlike at full resolution.
+    """
+
+    def __init__(self, channels: int, max_heads: int = 8):
+        super().__init__()
+        self.num_heads = attention_heads(channels, max_heads)
+        self.norm = nn.GroupNorm(group_norm_groups(channels), channels)
+        self.qkv = nn.Conv2d(channels, channels * 3, kernel_size=1)
+        self.proj = nn.Conv2d(channels, channels, kernel_size=1)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        batch, channels, height, width = x.shape
+        head_dim = channels // self.num_heads
+
+        hidden = self.norm(x)
+        query, key, value = self.qkv(hidden).chunk(3, dim=1)
+        query = query.reshape(batch, self.num_heads, head_dim, height * width)
+        key = key.reshape(batch, self.num_heads, head_dim, height * width)
+        value = value.reshape(batch, self.num_heads, head_dim, height * width)
+
+        attention = torch.einsum("bhdi,bhdj->bhij", query, key) * (head_dim**-0.5)
+        attention = attention.softmax(dim=-1)
+        out = torch.einsum("bhij,bhdj->bhdi", attention, value)
+        out = out.reshape(batch, channels, height, width)
+        return x + self.proj(out)
+
+
 class Downsample(nn.Module):
     """Stride-2 conv, halving spatial resolution."""
 
@@ -62,7 +102,9 @@ class TinyTimeConditionedCNN(nn.Module):
 
     Two downsampling stages (e.g. 32 -> 16 -> 8) with skip connections, so the network
     can mix information across the whole image cheaply at low resolution instead of only
-    ever operating at full resolution with local 3x3 receptive fields.
+    ever operating at full resolution with local 3x3 receptive fields. A self-attention layer
+    at the 8x8 bottleneck gives it a second, non-local mechanism for the same purpose, cheap
+    at that resolution (64 tokens).
 
     Time conditioning is the plain scheme (raw scalar (r, t) -> MLP -> single additive bias,
     injected once right after the input conv) -- FiLM and sinusoidal time embeddings are
@@ -103,6 +145,7 @@ class TinyTimeConditionedCNN(nn.Module):
         self.downsample_2 = Downsample(channels_2, channels_3)
 
         self.bottleneck_blocks = nn.ModuleList([ResidualConvBlock(channels_3) for _ in range(num_blocks)])
+        self.bottleneck_attention = SelfAttention2D(channels_3)
 
         self.upsample_2 = Upsample(channels_3, channels_2)
         self.merge_2 = nn.Conv2d(channels_2 * 2, channels_2, kernel_size=1)
@@ -140,6 +183,7 @@ class TinyTimeConditionedCNN(nn.Module):
 
         for block in self.bottleneck_blocks:
             hidden = block(hidden)
+        hidden = self.bottleneck_attention(hidden)
 
         hidden = self.upsample_2(hidden)
         hidden = self.merge_2(torch.cat([hidden, skip_2], dim=1))
