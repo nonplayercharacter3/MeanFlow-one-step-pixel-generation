@@ -35,6 +35,21 @@ def save_image(tensor: torch.Tensor, path: str) -> None:
     Image.fromarray(image).save(path)
 
 
+def save_image_grid(tensor: torch.Tensor, path: str) -> None:
+    """Save a batch of images (N, C, H, W) side by side in one PNG."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    images = tensor.detach().float().cpu().clamp(-1.0, 1.0)
+    images = (images + 1.0) * 0.5
+    num_images, _, height, width = images.shape
+    grid = Image.new("RGB", (width * num_images, height))
+    for index in range(num_images):
+        array = (images[index].permute(1, 2, 0).numpy() * 255.0).round().astype(np.uint8)
+        grid.paste(Image.fromarray(array), (index * width, 0))
+    grid.save(path)
+
+
 def append_loss_csv(path: str, step: int, loss: float, sample_mse: float) -> None:
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)

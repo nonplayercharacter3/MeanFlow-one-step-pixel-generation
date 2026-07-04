@@ -94,7 +94,7 @@ python -m py_compile train.py model.py meanflow.py utils.py
 
 ```bash
 python train.py \
-  --image data/smoke_test.png \
+  --images data/smoke_test.png \
   --steps 100 \
   --batch-size 8 \
   --sample-every 50 \
@@ -114,15 +114,35 @@ This verifies that:
 
 ```bash
 python train.py \
-  --image data/overfit1/imagenette_one.png \
+  --images data/overfit1/imagenette_one.png \
   --steps 5000 \
   --batch-size 8 \
+  --lr 3e-4 \
+  --hidden-channels 256 \
+  --num-blocks 6 \
   --sample-every 500 \
   --checkpoint-every 1000 \
   --output-dir outputs/imagenette_one_overfit
 ```
 
 The same clean image is repeated across the batch, but every batch element receives fresh random noise and newly sampled times.
+
+## Run the Three-Image Overfit Experiment (required milestone)
+
+```bash
+python train.py \
+  --images data/overfit3/image_0.png data/overfit3/image_1.png data/overfit3/image_2.png \
+  --steps 5000 \
+  --batch-size 9 \
+  --lr 3e-4 \
+  --hidden-channels 256 \
+  --num-blocks 6 \
+  --sample-every 500 \
+  --checkpoint-every 1000 \
+  --output-dir outputs/overfit3
+```
+
+`--images` accepts any number of paths; the batch is filled by cycling through them. Per-image clean/sample files are saved as `clean_0.png`, `clean_1.png`, ... and `sample_best_0.png`, `sample_best_1.png`, ..., alongside `clean_grid.png` / `sample_best_grid.png` contact sheets showing all images side by side. `sample_mse` is the mean reconstruction error averaged across all images.
 
 ## Training Procedure
 

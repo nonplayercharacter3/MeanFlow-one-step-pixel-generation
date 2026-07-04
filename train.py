@@ -7,7 +7,7 @@ from torch.func import jvp
 
 from meanflow import MeanFlowBatch, make_meanflow_batch, meanflow_loss, one_step_sample
 from model import TinyTimeConditionedCNN
-from utils import all_finite, append_loss_csv, load_image, save_image, set_seed
+from utils import all_finite, append_loss_csv, load_image, save_image, save_image_grid, set_seed
 
 
 def analytical_jvp_check(device: torch.device) -> None:
@@ -86,8 +86,14 @@ def run_sanity_checks(model, optimizer, clean_image: torch.Tensor) -> None:
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Minimal one-image MeanFlow training prototype.")
-    parser.add_argument("--image", type=str, required=True, help="Path to one RGB image.")
+    parser = argparse.ArgumentParser(description="Minimal MeanFlow overfit training prototype.")
+    parser.add_argument(
+        "--images",
+        type=str,
+        required=True,
+        nargs="+",
+        help="Path(s) to one or more fixed RGB images to overfit, e.g. --images a.png b.png c.png.",
+    )
     parser.add_argument("--steps", type=int, default=1000)
     parser.add_argument("--batch-size", type=int, default=16)
     parser.add_argument("--image-size", type=int, default=32)
@@ -131,13 +137,16 @@ def main() -> None:
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    clean_image = load_image(args.image, args.image_size, device)
-    clean_image = clean_image.repeat(args.batch_size, 1, 1, 1)
+    base_images = torch.cat([load_image(path, args.image_size, device) for path in args.images], dim=0)
+    num_images = base_images.shape[0]
+    repeats = -(-args.batch_size // num_images)  # ceil division
+    clean_image = base_images.repeat(repeats, 1, 1, 1)[: args.batch_size]
     print(
-        "Loaded image:",
-        tuple(clean_image.shape),
-        f"min={clean_image.min().item():.3f}",
-        f"max={clean_image.max().item():.3f}",
+        "Loaded images:",
+        num_images,
+        tuple(base_images.shape),
+        f"min={base_images.min().item():.3f}",
+        f"max={base_images.max().item():.3f}",
     )
 
     model = TinyTimeConditionedCNN(
@@ -166,10 +175,12 @@ def main() -> None:
 
     run_sanity_checks(model, optimizer, clean_image)
 
-    fixed_eval_noise = torch.randn(1, 3, args.image_size, args.image_size, device=device)
+    fixed_eval_noise = torch.randn(num_images, 3, args.image_size, args.image_size, device=device)
     torch.save(fixed_eval_noise.detach().cpu(), output_dir / "fixed_eval_noise.pt")
-    save_image(clean_image[:1], str(output_dir / "clean.png"))
-    save_image(fixed_eval_noise, str(output_dir / "fixed_noise.png"))
+    for index in range(num_images):
+        save_image(base_images[index : index + 1], str(output_dir / f"clean_{index}.png"))
+        save_image(fixed_eval_noise[index : index + 1], str(output_dir / f"fixed_noise_{index}.png"))
+    save_image_grid(base_images, str(output_dir / "clean_grid.png"))
 
     loss_csv = output_dir / "loss_history.csv"
     best_sample_mse = float("inf")
@@ -188,7 +199,7 @@ def main() -> None:
 
         with torch.no_grad():
             sample = one_step_sample(model, fixed_eval_noise)
-            sample_mse = F.mse_loss(sample, clean_image[:1]).item()
+            sample_mse = F.mse_loss(sample, base_images).item()
 
         loss_value = result.loss.item()
         append_loss_csv(str(loss_csv), step, loss_value, sample_mse)
@@ -196,7 +207,9 @@ def main() -> None:
         if sample_mse < best_sample_mse:
             best_sample_mse = sample_mse
             save_checkpoint(output_dir / "checkpoint_best.pt", step, model, optimizer, args, sample_mse)
-            save_image(sample, str(output_dir / "sample_best.png"))
+            for index in range(num_images):
+                save_image(sample[index : index + 1], str(output_dir / f"sample_best_{index}.png"))
+            save_image_grid(sample, str(output_dir / "sample_best_grid.png"))
 
         if step == 1 or step % 50 == 0:
             finite = all_finite(
@@ -220,7 +233,7 @@ def main() -> None:
             )
 
         if step == 1 or step % args.sample_every == 0:
-            save_image(sample, str(output_dir / f"sample_step_{step:04d}.png"))
+            save_image_grid(sample, str(output_dir / f"sample_step_{step:04d}.png"))
 
         if step % args.checkpoint_every == 0 or step == args.steps:
             save_checkpoint(output_dir / "checkpoint.pt", step, model, optimizer, args, sample_mse)
