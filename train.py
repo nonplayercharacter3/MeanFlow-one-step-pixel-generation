@@ -321,6 +321,9 @@ def main() -> None:
     save_image_grid(fixed_eval_noise, str(output_dir / "fixed_eval_noise_grid.png"))
 
     loss_csv = output_dir / "loss_history.csv"
+    # append_loss_csv only appends, so a reused output dir would interleave this run's rows
+    # with a previous run's and corrupt every downstream plot. One run, one CSV.
+    loss_csv.unlink(missing_ok=True)
     best_sample_mse = float("inf")
 
     image_indices = torch.arange(args.batch_size, device=device) % num_images
