@@ -104,14 +104,10 @@ def meanflow_loss(
     a few large-error samples dominate the plain-MSE gradient. p=0 (default) is plain MSE.
     """
 
-    def model_fn(z_t, r, t):
-        return model(z_t, r, t)
-
-    zeros_like_time = torch.zeros_like(batch.r)
     mean_velocity, jvp_term = jvp(
-        model_fn,
+        model,
         (batch.z_t, batch.r, batch.t),
-        (batch.velocity, zeros_like_time, torch.ones_like(batch.t)),
+        (batch.velocity, torch.zeros_like(batch.r), torch.ones_like(batch.t)),
     )
 
     time_gap = (batch.t - batch.r)[:, :, None, None]
