@@ -13,26 +13,18 @@ def set_seed(seed: int) -> None:
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
 
-# open and convert an image
 def load_image(path: str, image_size: int, device: torch.device) -> torch.Tensor:
     image = Image.open(path).convert("RGB")
     image = image.resize((image_size, image_size), Image.Resampling.BICUBIC)
     array = np.asarray(image).astype(np.float32) / 255.0
     tensor = torch.from_numpy(array).permute(2, 0, 1)
     tensor = tensor * 2.0 - 1.0
-
-    # return a tensor
     return tensor.unsqueeze(0).to(device=device, dtype=torch.float32)
 
 
 def save_image(tensor: torch.Tensor, path: str) -> None:
-    path = Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-
-    image = tensor.detach().float().cpu().clamp(-1.0, 1.0)
-    image = (image + 1.0) * 0.5
-    image = (image[0].permute(1, 2, 0).numpy() * 255.0).round().astype(np.uint8)
-    Image.fromarray(image).save(path)
+    """Save the first image of a (N, C, H, W) batch as a PNG."""
+    save_image_grid(tensor[:1], path)
 
 
 def save_image_grid(tensor: torch.Tensor, path: str) -> None:
@@ -48,6 +40,24 @@ def save_image_grid(tensor: torch.Tensor, path: str) -> None:
         array = (images[index].permute(1, 2, 0).numpy() * 255.0).round().astype(np.uint8)
         grid.paste(Image.fromarray(array), (index * width, 0))
     grid.save(path)
+
+
+def nearest_image_eval(samples: torch.Tensor, targets: torch.Tensor):
+    """Assignment-free scoring of one-step samples against the training images.
+
+    MeanFlow never promises which noise maps to which image -- the learned flow picks its
+    own noise->image basins -- so each sample is scored against its *nearest* target, not
+    a fixed pairing. Returns:
+      pairwise_mse: (num_samples, num_targets) MSE between every sample and every target
+      nearest_mse, nearest_image: each sample's distance to / index of its nearest target
+      order: sample indices sorted by (nearest target, error), so grids read basin by basin
+    """
+    pairwise_mse = ((samples[:, None] - targets[None, :]) ** 2).mean(dim=(2, 3, 4))
+    nearest_mse, nearest_image = pairwise_mse.min(dim=1)
+    order = sorted(
+        range(samples.shape[0]), key=lambda i: (nearest_image[i].item(), nearest_mse[i].item())
+    )
+    return pairwise_mse, nearest_mse, nearest_image, order
 
 
 def append_loss_csv(path: str, step: int, loss: float, sample_mse: float, per_image_mse=None) -> None:
