@@ -1,9 +1,9 @@
 """One-step sample from many fresh noises and measure reproduction assignment-free.
 
-train.py's sample_mse pairs fixed_noise[i] with image[i], but MeanFlow never enforces
-that pairing -- the learned marginal flow chooses its own noise->image basins. This
-script asks the question the assignment actually cares about: from N random noises,
-does each one-step sample land cleanly on *some* training image, and is every
+Unlike train.py's eval, which reuses the same fixed noises all run, this script draws
+fresh noises under a seed never used in training -- a held-out check that the model
+did not just memorize responses to particular noise tensors. It asks: from N random
+noises, does each one-step sample land cleanly on *some* training image, and is every
 training image produced by at least one noise?
 """
 
@@ -13,8 +13,8 @@ from pathlib import Path
 import torch
 
 from meanflow import one_step_sample
-from model import TinyTimeConditionedCNN
-from utils import load_image, save_image_grid, set_seed
+from model import MiniUNet
+from utils import load_image, nearest_image_eval, save_image_grid, set_seed
 
 
 def parse_args():
@@ -35,7 +35,7 @@ def main() -> None:
 
     checkpoint = torch.load(args.checkpoint, map_location=device)
     saved_args = checkpoint["args"]
-    model = TinyTimeConditionedCNN(
+    model = MiniUNet(
         hidden_channels=saved_args["hidden_channels"],
         time_dim=saved_args["time_dim"],
         num_blocks=saved_args["num_blocks"],
@@ -53,9 +53,7 @@ def main() -> None:
     with torch.no_grad():
         samples = one_step_sample(model, noise)
 
-    # (num_samples, num_images) MSE between every sample and every training image.
-    pairwise_mse = ((samples[:, None] - targets[None, :]) ** 2).mean(dim=(2, 3, 4))
-    nearest_mse, nearest_image = pairwise_mse.min(dim=1)
+    pairwise_mse, nearest_mse, nearest_image, order = nearest_image_eval(samples, targets)
 
     print(f"\nPer-sample nearest training image ({args.num_samples} fresh noises):")
     for index in range(args.num_samples):
@@ -69,8 +67,6 @@ def main() -> None:
     print(f"  mean nearest-image mse: {nearest_mse.mean().item():.4f}")
 
     output_dir = Path(args.output_dir or Path(args.checkpoint).parent)
-    # Sort the grid by (assigned image, error) so basins read left to right.
-    order = sorted(range(args.num_samples), key=lambda i: (nearest_image[i].item(), nearest_mse[i].item()))
     save_image_grid(samples[order], str(output_dir / "samples_many_noises.png"))
     save_image_grid(targets, str(output_dir / "samples_many_noises_targets.png"))
     print(f"\nSaved grid (sorted by nearest image) to {output_dir}/samples_many_noises.png")

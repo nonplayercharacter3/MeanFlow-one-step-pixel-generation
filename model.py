@@ -103,30 +103,8 @@ class SelfAttention2D(nn.Module):
         return x + self.proj(out)
 
 
-class Downsample(nn.Module):
-    """Stride-2 conv, halving spatial resolution."""
-
-    def __init__(self, in_channels: int, out_channels: int):
-        super().__init__()
-        self.conv = nn.Conv2d(in_channels, out_channels, kernel_size=3, stride=2, padding=1)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.conv(x)
-
-
-class Upsample(nn.Module):
-    """Stride-2 transposed conv, doubling spatial resolution back."""
-
-    def __init__(self, in_channels: int, out_channels: int):
-        super().__init__()
-        self.conv = nn.ConvTranspose2d(in_channels, out_channels, kernel_size=4, stride=2, padding=1)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.conv(x)
-
-
-class TinyTimeConditionedCNN(nn.Module):
-    """A small time-conditioned mini U-Net that predicts an RGB velocity field.
+class MiniUNet(nn.Module):
+    """A small time-conditioned U-Net that predicts an RGB (mean-)velocity field.
 
     Two downsampling stages (e.g. 32 -> 16 -> 8) with skip connections, so the network
     can mix information across the whole image cheaply at low resolution instead of only
@@ -136,10 +114,7 @@ class TinyTimeConditionedCNN(nn.Module):
 
     Time conditioning: sinusoidal embeddings of t and of the gap (t - r) -- the two
     quantities the MeanFlow target actually depends on -- concatenated, passed through an
-    MLP, and injected into every residual block via FiLM. The earlier plain scheme (raw
-    scalar (r, t) -> single additive input bias) existed only to isolate the U-Net as the
-    experimental variable; with one input-level bias the network is structurally almost
-    incapable of representing the du/dt that the JVP target regresses.
+    MLP, and injected into every residual block via FiLM.
 
     `num_blocks` is blocks *per resolution level* (5 levels total: down1, down2, bottleneck,
     up2, up1) -- keep it small (1-2) since width doubles at each of the two downsampling
@@ -169,19 +144,19 @@ class TinyTimeConditionedCNN(nn.Module):
         self.input_conv = nn.Conv2d(image_channels, channels_1, kernel_size=3, padding=1)
 
         self.down_blocks_1 = nn.ModuleList([ResidualConvBlock(channels_1, time_dim) for _ in range(num_blocks)])
-        self.downsample_1 = Downsample(channels_1, channels_2)
+        self.downsample_1 = nn.Conv2d(channels_1, channels_2, kernel_size=3, stride=2, padding=1)
 
         self.down_blocks_2 = nn.ModuleList([ResidualConvBlock(channels_2, time_dim) for _ in range(num_blocks)])
-        self.downsample_2 = Downsample(channels_2, channels_3)
+        self.downsample_2 = nn.Conv2d(channels_2, channels_3, kernel_size=3, stride=2, padding=1)
 
         self.bottleneck_blocks = nn.ModuleList([ResidualConvBlock(channels_3, time_dim) for _ in range(num_blocks)])
         self.bottleneck_attention = SelfAttention2D(channels_3)
 
-        self.upsample_2 = Upsample(channels_3, channels_2)
+        self.upsample_2 = nn.ConvTranspose2d(channels_3, channels_2, kernel_size=4, stride=2, padding=1)
         self.merge_2 = nn.Conv2d(channels_2 * 2, channels_2, kernel_size=1)
         self.up_blocks_2 = nn.ModuleList([ResidualConvBlock(channels_2, time_dim) for _ in range(num_blocks)])
 
-        self.upsample_1 = Upsample(channels_2, channels_1)
+        self.upsample_1 = nn.ConvTranspose2d(channels_2, channels_1, kernel_size=4, stride=2, padding=1)
         self.merge_1 = nn.Conv2d(channels_1 * 2, channels_1, kernel_size=1)
         self.up_blocks_1 = nn.ModuleList([ResidualConvBlock(channels_1, time_dim) for _ in range(num_blocks)])
 

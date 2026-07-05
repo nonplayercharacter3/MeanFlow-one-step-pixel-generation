@@ -1,12 +1,23 @@
 import argparse
+import copy
 from pathlib import Path
 
 import torch
 from torch.func import jvp
 
 from meanflow import make_meanflow_batch, meanflow_loss, one_step_sample
-from model import TinyTimeConditionedCNN
-from utils import EMA, all_finite, append_loss_csv, load_image, save_image, save_image_grid, save_loss_curve, set_seed
+from model import MiniUNet
+from utils import (
+    EMA,
+    all_finite,
+    append_loss_csv,
+    load_image,
+    nearest_image_eval,
+    save_image,
+    save_image_grid,
+    save_loss_curve,
+    set_seed,
+)
 
 
 def analytical_jvp_check(device: torch.device) -> None:
@@ -65,6 +76,7 @@ def run_sanity_checks(model, optimizer, clean_image: torch.Tensor) -> None:
     assert not result.target.requires_grad
 
     before = parameter_snapshot(model)
+    optimizer_state = copy.deepcopy(optimizer.state_dict())
     optimizer.zero_grad(set_to_none=True)
     result.loss.backward()
 
@@ -84,6 +96,16 @@ def run_sanity_checks(model, optimizer, clean_image: torch.Tensor) -> None:
     assert any(
         not torch.allclose(b, a) for b, a in zip(before, after)
     ), "optimizer step did not change any parameter"
+
+    # Undo the probe step so the check is a true no-op: training (and any --resume-from
+    # state) starts exactly where it would have without it.
+    with torch.no_grad():
+        for parameter, saved in zip(
+            (p for p in model.parameters() if p.requires_grad), before
+        ):
+            parameter.copy_(saved)
+    optimizer.load_state_dict(optimizer_state)
+    optimizer.zero_grad(set_to_none=True)
 
     print("Sanity checks passed.")
 
@@ -123,7 +145,12 @@ def parse_args():
     )
     parser.add_argument("--hidden-channels", type=int, default=128)
     parser.add_argument("--time-dim", type=int, default=64)
-    parser.add_argument("--num-blocks", type=int, default=4)
+    parser.add_argument(
+        "--num-blocks",
+        type=int,
+        default=2,
+        help="Residual blocks per resolution level; matches the model default and the documented recipes.",
+    )
     parser.add_argument("--grad-clip", type=float, default=1.0, help="Max gradient norm. Set to 0 to disable.")
     parser.add_argument(
         "--resume-from",
@@ -236,7 +263,7 @@ def main() -> None:
         f"max={base_images.max().item():.3f}",
     )
 
-    model = TinyTimeConditionedCNN(
+    model = MiniUNet(
         hidden_channels=args.hidden_channels,
         time_dim=args.time_dim,
         num_blocks=args.num_blocks,
@@ -276,7 +303,7 @@ def main() -> None:
 
     eval_model = None
     if ema is not None:
-        eval_model = TinyTimeConditionedCNN(
+        eval_model = MiniUNet(
             hidden_channels=args.hidden_channels,
             time_dim=args.time_dim,
             num_blocks=args.num_blocks,
@@ -364,9 +391,7 @@ def main() -> None:
                     sample = one_step_sample(eval_model, fixed_eval_noise)
                 else:
                     sample = one_step_sample(model, fixed_eval_noise)
-                # (num_eval_noises, num_images) MSE between every sample and every image.
-                pairwise_mse = ((sample[:, None] - base_images[None, :]) ** 2).mean(dim=(2, 3, 4))
-                nearest_mse, nearest_image = pairwise_mse.min(dim=1)
+                pairwise_mse, nearest_mse, nearest_image, order = nearest_image_eval(sample, base_images)
                 # sample_mse: are all samples clean copies of some training image?
                 sample_mse = nearest_mse.mean().item()
                 # per_image_mse: how well is each image reproduced by its best-matching noise?
@@ -390,10 +415,6 @@ def main() -> None:
                 for index in range(num_images):
                     best_sample = sample[best_noise_index[index] : best_noise_index[index] + 1]
                     save_image(best_sample, str(output_dir / f"sample_best_{index}.png"))
-                # Sort by (assigned image, error) so the basins read left to right.
-                order = sorted(
-                    range(num_eval_noises), key=lambda i: (nearest_image[i].item(), nearest_mse[i].item())
-                )
                 save_image_grid(sample[order], str(output_dir / "sample_best_grid.png"))
 
             if step == 1 or step % 50 == 0:
