@@ -5,6 +5,7 @@ from pathlib import Path
 import torch
 from torch.func import jvp
 
+from dataset import infinite_batches, make_dataloader
 from meanflow import make_meanflow_batch, meanflow_loss, one_step_sample
 from model import MiniUNet
 from utils import (
@@ -111,14 +112,23 @@ def run_sanity_checks(model, optimizer, clean_image: torch.Tensor) -> None:
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Minimal MeanFlow overfit training prototype.")
+    parser = argparse.ArgumentParser(description="Minimal MeanFlow training prototype.")
     parser.add_argument(
         "--images",
         type=str,
-        required=True,
+        default=None,
         nargs="+",
         help="Path(s) to one or more fixed RGB images to overfit, e.g. --images a.png b.png c.png.",
     )
+    parser.add_argument(
+        "--data-dir",
+        type=str,
+        default=None,
+        help="Root of an image folder (e.g. data/imagenette2-160/train) to train on the whole "
+        "dataset instead of overfitting --images -- the assignment's 10-class bonus. "
+        "Pass exactly one of --images / --data-dir.",
+    )
+    parser.add_argument("--num-workers", type=int, default=2, help="DataLoader workers for --data-dir mode.")
     parser.add_argument("--steps", type=int, default=1000)
     parser.add_argument("--batch-size", type=int, default=16)
     parser.add_argument("--image-size", type=int, default=32)
@@ -233,7 +243,12 @@ def parse_args():
         help="Number of fixed noises used for the assignment-free eval. More noises make it likelier "
         "that every training image has at least one eval noise inside its basin.",
     )
-    return parser.parse_args()
+    args = parser.parse_args()
+    if (args.images is None) == (args.data_dir is None):
+        parser.error("pass exactly one of --images or --data-dir")
+    if args.reweight_images and args.data_dir:
+        parser.error("--reweight-images needs the per-image eval, which only exists with --images")
+    return args
 
 
 def main() -> None:
@@ -251,17 +266,25 @@ def main() -> None:
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    base_images = torch.cat([load_image(path, args.image_size, device) for path in args.images], dim=0)
-    num_images = base_images.shape[0]
-    repeats = -(-args.batch_size // num_images)  # ceil division
-    clean_image = base_images.repeat(repeats, 1, 1, 1)[: args.batch_size]
-    print(
-        "Loaded images:",
-        num_images,
-        tuple(base_images.shape),
-        f"min={base_images.min().item():.3f}",
-        f"max={base_images.max().item():.3f}",
-    )
+    overfit_images = args.images is not None
+    if overfit_images:
+        base_images = torch.cat([load_image(path, args.image_size, device) for path in args.images], dim=0)
+        num_images = base_images.shape[0]
+        repeats = -(-args.batch_size // num_images)  # ceil division
+        clean_image = base_images.repeat(repeats, 1, 1, 1)[: args.batch_size]
+        print(
+            "Loaded images:",
+            num_images,
+            tuple(base_images.shape),
+            f"min={base_images.min().item():.3f}",
+            f"max={base_images.max().item():.3f}",
+        )
+    else:
+        loader = make_dataloader(args.data_dir, args.image_size, args.batch_size, args.num_workers)
+        batches = infinite_batches(loader)
+        # Also used by the sanity checks and saved as a reference grid below.
+        clean_image = next(batches).to(device)
+        print(f"Loaded dataset: {len(loader.dataset)} images under {args.data_dir}")
 
     model = MiniUNet(
         hidden_channels=args.hidden_channels,
@@ -334,31 +357,40 @@ def main() -> None:
 
     run_sanity_checks(model, optimizer, clean_image)
 
-    # The eval is assignment-free: MeanFlow never promises that noise i maps to image i --
-    # the learned marginal flow picks its own noise->image basins. Pairing fixed_noise[i]
-    # with image[i] (the old scheme) reported a large "error" whenever a noise sat in
-    # another image's basin, even while every sample was a clean copy of *some* training
-    # image. So we sample more noises than images and score each image by its best
-    # reproduction across all of them.
-    num_eval_noises = max(args.num_eval_noises, num_images)
+    if overfit_images:
+        # The eval is assignment-free: MeanFlow never promises that noise i maps to image i --
+        # the learned marginal flow picks its own noise->image basins. Pairing fixed_noise[i]
+        # with image[i] (the old scheme) reported a large "error" whenever a noise sat in
+        # another image's basin, even while every sample was a clean copy of *some* training
+        # image. So we sample more noises than images and score each image by its best
+        # reproduction across all of them.
+        num_eval_noises = max(args.num_eval_noises, num_images)
+        for index in range(num_images):
+            save_image(base_images[index : index + 1], str(output_dir / f"clean_{index}.png"))
+        save_image_grid(base_images, str(output_dir / "clean_grid.png"))
+        image_indices = torch.arange(args.batch_size, device=device) % num_images
+        per_image_weight = torch.ones(num_images, device=device)
+        metric_label = "sample_mse"
+    else:
+        # With ~10k images there is no per-image reproduction metric; the fixed noises are
+        # only for watching sample grids evolve, and training is steered by a smoothed loss.
+        num_eval_noises = args.num_eval_noises
+        save_image_grid(clean_image[:num_eval_noises], str(output_dir / "train_batch_grid.png"))
+        metric_label = "smoothed_loss"
     fixed_eval_noise = torch.randn(num_eval_noises, 3, args.image_size, args.image_size, device=device)
-    for index in range(num_images):
-        save_image(base_images[index : index + 1], str(output_dir / f"clean_{index}.png"))
-    save_image_grid(base_images, str(output_dir / "clean_grid.png"))
     save_image_grid(fixed_eval_noise, str(output_dir / "fixed_eval_noise_grid.png"))
 
     loss_csv = output_dir / "loss_history.csv"
     # append_loss_csv only appends, so a reused output dir would interleave this run's rows
     # with a previous run's and corrupt every downstream plot. One run, one CSV.
     loss_csv.unlink(missing_ok=True)
-    best_sample_mse = float("inf")
-
-    image_indices = torch.arange(args.batch_size, device=device) % num_images
-    per_image_weight = torch.ones(num_images, device=device)
+    best_metric = float("inf")
+    smoothed_loss = None
 
     for step in range(1, args.steps + 1):
+        clean = clean_image if overfit_images else next(batches).to(device, non_blocking=True)
         batch = make_meanflow_batch(
-            clean_image, args.equal_time_probability, args.endpoint_probability, args.time_sampling
+            clean, args.equal_time_probability, args.endpoint_probability, args.time_sampling
         )
         sample_weight = per_image_weight[image_indices] if args.reweight_images else None
         result = meanflow_loss(model, batch, sample_weight, args.loss_weight_power, args.loss_weight_c)
@@ -374,6 +406,9 @@ def main() -> None:
             ema.update(model)
 
         loss_value = result.loss.item()
+        # Per-step loss is far too noisy to steer on in dataset mode (fresh images every
+        # step); smooth it over ~50 steps for best-checkpoint selection and the LR plateau.
+        smoothed_loss = loss_value if smoothed_loss is None else 0.98 * smoothed_loss + 0.02 * loss_value
 
         needs_eval = (
             step == 1
@@ -391,31 +426,40 @@ def main() -> None:
                     sample = one_step_sample(eval_model, fixed_eval_noise)
                 else:
                     sample = one_step_sample(model, fixed_eval_noise)
-                pairwise_mse, nearest_mse, nearest_image, order = nearest_image_eval(sample, base_images)
-                # sample_mse: are all samples clean copies of some training image?
-                sample_mse = nearest_mse.mean().item()
-                # per_image_mse: how well is each image reproduced by its best-matching noise?
-                per_image_mse, best_noise_index = pairwise_mse.min(dim=0)
-                per_image_mse = per_image_mse.tolist()
 
-            if args.reweight_images:
-                per_image_mse_tensor = torch.tensor(per_image_mse, device=device)
-                per_image_weight = (per_image_mse_tensor / per_image_mse_tensor.mean().clamp_min(1e-8)).clamp(
-                    0.2, 5.0
-                )
+            if overfit_images:
+                with torch.no_grad():
+                    pairwise_mse, nearest_mse, nearest_image, order = nearest_image_eval(sample, base_images)
+                    # metric: are all samples clean copies of some training image?
+                    metric = nearest_mse.mean().item()
+                    # per_image_mse: how well is each image reproduced by its best-matching noise?
+                    per_image_mse, best_noise_index = pairwise_mse.min(dim=0)
+                    per_image_mse = per_image_mse.tolist()
+
+                if args.reweight_images:
+                    per_image_mse_tensor = torch.tensor(per_image_mse, device=device)
+                    per_image_weight = (per_image_mse_tensor / per_image_mse_tensor.mean().clamp_min(1e-8)).clamp(
+                        0.2, 5.0
+                    )
+            else:
+                metric = smoothed_loss
+                per_image_mse = []
 
             if plateau_scheduler is not None:
-                plateau_scheduler.step(sample_mse)
+                plateau_scheduler.step(metric)
 
-            append_loss_csv(str(loss_csv), step, loss_value, sample_mse, per_image_mse)
+            append_loss_csv(str(loss_csv), step, loss_value, metric, per_image_mse, metric_name=metric_label)
 
-            if sample_mse < best_sample_mse:
-                best_sample_mse = sample_mse
-                save_checkpoint(output_dir / "checkpoint_best.pt", step, model, optimizer, args, sample_mse, ema)
-                for index in range(num_images):
-                    best_sample = sample[best_noise_index[index] : best_noise_index[index] + 1]
-                    save_image(best_sample, str(output_dir / f"sample_best_{index}.png"))
-                save_image_grid(sample[order], str(output_dir / "sample_best_grid.png"))
+            if metric < best_metric:
+                best_metric = metric
+                save_checkpoint(output_dir / "checkpoint_best.pt", step, model, optimizer, args, metric, ema)
+                if overfit_images:
+                    for index in range(num_images):
+                        best_sample = sample[best_noise_index[index] : best_noise_index[index] + 1]
+                        save_image(best_sample, str(output_dir / f"sample_best_{index}.png"))
+                    save_image_grid(sample[order], str(output_dir / "sample_best_grid.png"))
+                else:
+                    save_image_grid(sample, str(output_dir / "sample_best_grid.png"))
 
             if step == 1 or step % 50 == 0:
                 finite = all_finite(
@@ -428,13 +472,17 @@ def main() -> None:
                     sample,
                 )
                 current_lr = optimizer.param_groups[0]["lr"]
-                per_image_str = " ".join(f"img{i}={mse:.4f}" for i, mse in enumerate(per_image_mse))
+                per_image_str = (
+                    " ".join(f"img{i}={mse:.4f}" for i, mse in enumerate(per_image_mse))
+                    if overfit_images
+                    else ""
+                )
                 print(
                     f"step={step:04d}",
                     f"lr={current_lr:.6f}",
                     f"loss={loss_value:.6f}",
-                    f"sample_mse={sample_mse:.6f}",
-                    f"[{per_image_str}]",
+                    f"{metric_label}={metric:.6f}",
+                    f"[{per_image_str}]" if overfit_images else "",
                     f"|u|={result.mean_velocity.abs().mean().item():.4f}",
                     f"|jvp|={result.jvp_term.abs().mean().item():.4f}",
                     f"finite={finite}",
@@ -444,11 +492,11 @@ def main() -> None:
                 save_image_grid(sample, str(output_dir / f"sample_step_{step:04d}.png"))
 
             if step % args.checkpoint_every == 0 or step == args.steps:
-                save_checkpoint(output_dir / "checkpoint.pt", step, model, optimizer, args, sample_mse, ema)
+                save_checkpoint(output_dir / "checkpoint.pt", step, model, optimizer, args, metric, ema)
 
     save_loss_curve(str(loss_csv), str(output_dir / "loss_curve.png"))
 
-    print(f"Best sample_mse={best_sample_mse:.6f}")
+    print(f"Best {metric_label}={best_metric:.6f}")
     print(f"Done. Outputs saved in {output_dir}")
 
 

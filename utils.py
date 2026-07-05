@@ -60,7 +60,9 @@ def nearest_image_eval(samples: torch.Tensor, targets: torch.Tensor):
     return pairwise_mse, nearest_mse, nearest_image, order
 
 
-def append_loss_csv(path: str, step: int, loss: float, sample_mse: float, per_image_mse=None) -> None:
+def append_loss_csv(
+    path: str, step: int, loss: float, metric: float, per_image_mse=None, metric_name: str = "sample_mse"
+) -> None:
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     needs_header = not path.exists()
@@ -68,9 +70,9 @@ def append_loss_csv(path: str, step: int, loss: float, sample_mse: float, per_im
     with path.open("a", newline="") as handle:
         writer = csv.writer(handle)
         if needs_header:
-            header = ["step", "loss", "sample_mse"] + [f"sample_mse_{i}" for i in range(len(per_image_mse))]
+            header = ["step", "loss", metric_name] + [f"{metric_name}_{i}" for i in range(len(per_image_mse))]
             writer.writerow(header)
-        writer.writerow([step, loss, sample_mse, *per_image_mse])
+        writer.writerow([step, loss, metric, *per_image_mse])
 
 
 def all_finite(*tensors: torch.Tensor) -> bool:
@@ -99,30 +101,33 @@ class EMA:
 
 
 def save_loss_curve(csv_path: str, out_path: str) -> None:
-    """Read a loss_history.csv and save a loss/sample_mse-vs-step plot."""
+    """Read a loss_history.csv and plot every column against step, log scale.
+
+    Column meaning comes from the header, so this works for both eval modes: loss +
+    sample_mse (+ per-image columns) when overfitting, loss + smoothed_loss on a dataset.
+    """
     import matplotlib
 
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
-    steps, losses, sample_mses = [], [], []
-    per_image_columns = []
     with Path(csv_path).open() as handle:
         reader = csv.DictReader(handle)
-        per_image_columns = [name for name in (reader.fieldnames or []) if name.startswith("sample_mse_")]
-        per_image_series = {name: [] for name in per_image_columns}
+        columns = [name for name in (reader.fieldnames or []) if name != "step"]
+        steps, series = [], {name: [] for name in columns}
         for row in reader:
             steps.append(int(row["step"]))
-            losses.append(float(row["loss"]))
-            sample_mses.append(float(row["sample_mse"]))
-            for name in per_image_columns:
-                per_image_series[name].append(float(row[name]))
+            for name in columns:
+                series[name].append(float(row[name]))
 
     fig, ax = plt.subplots(figsize=(6, 4))
-    ax.plot(steps, losses, label="loss", alpha=0.8)
-    ax.plot(steps, sample_mses, label="sample_mse", color="black", linewidth=2)
-    for name in per_image_columns:
-        ax.plot(steps, per_image_series[name], label=name, alpha=0.6, linestyle="--")
+    for position, name in enumerate(columns):
+        if position == 0:
+            ax.plot(steps, series[name], label=name, alpha=0.8)
+        elif position == 1:
+            ax.plot(steps, series[name], label=name, color="black", linewidth=2)
+        else:
+            ax.plot(steps, series[name], label=name, alpha=0.6, linestyle="--")
     ax.set_xlabel("step")
     ax.set_yscale("log")
     ax.set_title("Training curves")
