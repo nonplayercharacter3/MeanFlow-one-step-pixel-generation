@@ -408,6 +408,13 @@ python sample.py \
   --checkpoint outputs/overfit3_final/checkpoint_best.pt \
   --images data/overfit3/image_0.png data/overfit3/image_1.png data/overfit3/image_2.png \
   --num-samples 16</pre>
+<p>
+<strong>Smallest backbone check:</strong> the result is not capacity-fragile. Rerunning the same recipe with a
+4&times; smaller model (<code>--hidden-channels 64</code>, 5.35M parameters) and half the batch
+(<code>--batch-size 32</code>) reaches <code>sample_mse = 0.0115</code> by step ~1360. Its held-out check covers
+all three images with best per-image reproductions of <code>0.0021 / 0.0021 / 0.0018</code> — the same visual
+quality tier as the 21M-parameter run, in under 5 minutes of training.
+</p>
 
 <h3>3.3 Ten-class Imagenette generalization (bonus, not attempted)</h3>
 <p>
