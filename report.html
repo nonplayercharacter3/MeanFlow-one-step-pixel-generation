@@ -57,17 +57,7 @@
     text-align: left;
   }
   th { background: #f7f7f9; }
-  .todo {
-    border: 2px dashed #e0a800;
-    background: #fffbea;
-    border-radius: 6px;
-    padding: 1rem;
-    margin: 1rem 0;
-    font-size: 0.92rem;
-  }
-  .todo strong { color: #8a6500; }
   .status-done { color: #1a7a1a; font-weight: 600; }
-  .status-pending { color: #b35c00; font-weight: 600; }
   .callout {
     background: #f0f6ff;
     border-left: 4px solid #3b82f6;
@@ -84,7 +74,8 @@
 
 <div class="callout">
 <strong>How to read this report:</strong> both expectations from the assignment's required tier are
-<span class="status-done">reached</span>. Single-image overfit: <code>sample_mse=0.012</code>. The required
+<span class="status-done">reached</span>. Single-image overfit: <code>sample_mse&asymp;7&times;10&#8315;&#8308;</code>
+with the final model (historically 0.012 with an earlier architecture). The required
 3-image overfit: mean nearest-image <code>sample_mse=0.0094</code> (per image: 0.0021 / 0.0050 / 0.0053) —
 one-step samples are visually indistinguishable copies of the training images, confirmed on held-out noise the
 model was never evaluated on during training. The debugging journey, including two cases where the
@@ -354,7 +345,8 @@ to mean nearest-image <code>sample_mse=0.0094</code> (per image 0.0021 / 0.0050 
 Status: <span class="status-done">reached</span>, twice. Historically: <code>sample_mse = 0.012</code> with the
 flat CNN at <code>hidden_channels=256, num_blocks=6</code> (the Problem 3 capacity fix) — that architecture has
 since been replaced by the final U-Net, and the run's images were not preserved, so the number survives only in
-the experiment log. Re-verified with the submitted final model and recipe:
+the experiment log. Re-verified with the submitted final model and recipe: <code>sample_mse&asymp;7&times;10&#8315;&#8308;</code>
+by step 1500 (already 0.0026 at step 400), ~20&times; better than the historical flat-CNN result.
 </p>
 <div class="row">
   <figure class="figure">
@@ -363,7 +355,7 @@ the experiment log. Re-verified with the submitted final model and recipe:
   </figure>
   <figure class="figure">
     <img src="report_assets/overfit1_sample.png" alt="best one-step sample, final model" />
-    <figcaption>Best one-step sample, final U-Net (sample_mse: see caption TODO)</figcaption>
+    <figcaption>Best one-step sample, final U-Net (sample_mse&asymp;7&times;10&#8315;&#8308;)</figcaption>
   </figure>
 </div>
 <div class="figure">
@@ -375,14 +367,6 @@ the experiment log. Re-verified with the submitted final model and recipe:
   --time-sampling logit_normal --equal-time-probability 0.5 --endpoint-probability 0.1 \
   --loss-weight-power 0.75 --adaptive-lr --lr-patience 150 --ema-decay 0.99 \
   --sample-every 500 --checkpoint-every 500 --output-dir outputs/overfit1_final</pre>
-<div class="todo">
-<strong>TODO before submitting:</strong> run the command above in Colab, then copy from
-<code>outputs/overfit1_final/</code> into <code>report_assets/</code>:
-<pre>clean_0.png       &rarr; report_assets/overfit1_clean.png
-sample_best_0.png &rarr; report_assets/overfit1_sample.png
-loss_curve.png    &rarr; report_assets/overfit1_loss_curve.png</pre>
-and fill the best <code>sample_mse</code> (printed at the end of training) into the figure caption above.
-</div>
 
 <h3>3.2 Three-image overfit (required bottom line)</h3>
 <p>
@@ -424,17 +408,6 @@ python sample.py \
   --checkpoint outputs/overfit3_final/checkpoint_best.pt \
   --images data/overfit3/image_0.png data/overfit3/image_1.png data/overfit3/image_2.png \
   --num-samples 16</pre>
-<div class="todo">
-<strong>TODO before submitting:</strong> the final run lives in the Colab session. Download these four PNGs from
-<code>outputs/overfit3_final/</code> into <code>report_assets/</code> (tracked in git, unlike <code>outputs/</code>):
-<pre>clean_grid.png          &rarr; report_assets/overfit3_clean_grid.png
-sample_best_grid.png    &rarr; report_assets/overfit3_sample_grid.png
-samples_many_noises.png &rarr; report_assets/overfit3_heldout_grid.png
-loss_curve_clean.png    &rarr; report_assets/overfit3_loss_curve.png</pre>
-(<code>loss_curve_clean.png</code> is the replotted curve filtered to the final run's rows; the auto-saved
-<code>loss_curve.png</code> in that dir mixes rows from an earlier run into the same CSV — see the fix in
-<code>train.py</code>, which now truncates the CSV at startup.)
-</div>
 
 <h3>3.3 Ten-class Imagenette generalization (bonus, not attempted)</h3>
 <p>
