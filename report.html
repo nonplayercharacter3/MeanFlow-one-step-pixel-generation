@@ -78,7 +78,9 @@
 with the final model (historically 0.012 with an earlier architecture). The required
 3-image overfit: mean nearest-image <code>sample_mse=0.0094</code> (per image: 0.0021 / 0.0050 / 0.0053) —
 one-step samples are visually indistinguishable copies of the training images, confirmed on held-out noise the
-model was never evaluated on during training. The debugging journey, including two cases where the
+model was never evaluated on during training. The bonus tier is also
+<span class="status-done">reached</span>: trained on the full 10-class Imagenette train split, one-step samples
+show recognizable structure (Section 3.3). The debugging journey, including two cases where the
 <em>measurement itself</em> was the bug (Problems 5&ndash;6), is documented in Section 2. No numbers or images
 are fabricated to look better than what was actually measured.
 </div>
@@ -416,11 +418,63 @@ all three images with best per-image reproductions of <code>0.0021 / 0.0021 / 0.
 quality tier as the 21M-parameter run, in under 5 minutes of training.
 </p>
 
-<h3>3.3 Ten-class Imagenette generalization (bonus, not attempted)</h3>
+<h3>3.3 Ten-class Imagenette generalization (bonus)</h3>
 <p>
-Not attempted. The required bottom line (3-image overfit) was prioritized first, per the assignment's own guidance
-("If 3 images won't overfit, scaling up won't help").
+Status: <span class="status-done">reached</span> — trained unconditionally on the full Imagenette train split
+(9,469 images, 10 classes, 32&times;32 pixel space), one-step samples show recognizable structure: coherent
+scene layouts (sky/ground splits, water), animal- and vehicle-shaped subjects, dataset-plausible palettes. The
+assignment's bonus bar is "one-step samples on the training set look reasonable (recognizable structure, not
+noise). Full held-out quality is not required."
 </p>
+<p>
+The overfit machinery transferred almost unchanged. New for this mode: a minimal PIL-based image-folder loader
+(<code>dataset.py</code>, ~70 lines — shorter side resized, center crop, random horizontal flip; no torchvision
+dependency), and a different steering signal — with ~10k training images there is no per-image reproduction
+metric, so best-checkpoint selection and LR control run on an EMA-smoothed training loss, and the fixed eval
+noises are kept only to watch sample grids evolve. The recipe is the paper-flavored one built during the overfit
+debugging: logit-normal time sampling, 50% <code>r==t</code>, endpoint bias 0.1, adaptive loss weighting
+<code>p=1</code> (the paper's ImageNet setting).
+</p>
+<div class="figure">
+  <img src="report_assets/imagenette10_train_batch_grid.png" alt="16 training images" />
+  <figcaption>Training data reference: one batch of Imagenette crops (32&times;32)</figcaption>
+</div>
+<div class="figure">
+  <img src="report_assets/imagenette10_sample_step_1000.png" alt="one-step samples at step 1000" />
+  <figcaption>One-step samples from the 16 fixed eval noises at step 1,000 — murky low-frequency blobs</figcaption>
+</div>
+<div class="figure">
+  <img src="report_assets/imagenette10_sample_step_5000.png" alt="one-step samples at step 5000" />
+  <figcaption>Step 5,000 — distinct scenes emerge: subjects separate from backgrounds</figcaption>
+</div>
+<div class="figure">
+  <img src="report_assets/imagenette10_sample_step_20000.png" alt="one-step samples at step 20000" />
+  <figcaption>Step 20,000 (final, LR fully annealed) — cleaner compositions; 16 noises give 16 different
+  scenes, i.e. the model learned a distribution, not a collapsed mode</figcaption>
+</div>
+<div class="figure">
+  <img src="report_assets/imagenette10_loss_curve.png" alt="10-class run training curves" style="max-width:480px" />
+  <figcaption>Training loss and its EMA-smoothed version (log scale). The compressed scale is expected: with
+  <code>p=1</code> weighting each sample contributes <code>err/(err+10&#8315;&sup3;)</code>, which saturates just
+  below 1 until errors approach 10&#8315;&sup3; — so the visible loss creeps 0.999&rarr;0.994 while sample quality
+  improves dramatically. The sample grids, not the loss, are the progress instrument in this mode.</figcaption>
+</div>
+<p>
+Two engineering notes from this run. (1) Batch 128 OOM'd the 22&nbsp;GB Colab L4: the forward-mode JVP roughly
+doubles activation memory and the backward graph multiplies it again; batch 64 peaks at ~17&nbsp;GB and trains
+identically well. (2) The run was deliberately staged: 20k fully-annealed steps (~1.5&nbsp;h,
+<code>--lr-decay-steps</code> matching <code>--steps</code>) instead of a speculative 60k — structure either
+appears by ~10&ndash;15k steps or more steps won't fix it, and <code>--resume-from</code> makes extending cheap
+if desired. Structure was clearly visible by step 5,000.
+</p>
+<p>Reproduce command (~1.5 h on a Colab L4; see <code>Run_Imagenette10_in_Colab.ipynb</code> for the full
+setup including the dataset download):</p>
+<pre>python train.py --data-dir data/imagenette2-160/train \
+  --steps 20000 --batch-size 64 --lr 3e-4 --lr-decay-steps 20000 \
+  --time-sampling logit_normal --equal-time-probability 0.5 --endpoint-probability 0.1 \
+  --loss-weight-power 1.0 \
+  --eval-every 100 --sample-every 1000 --checkpoint-every 2000 \
+  --num-eval-noises 16 --num-workers 4 --output-dir outputs/imagenette10</pre>
 
 <h2>4. Known Limitations</h2>
 <ul>
@@ -430,7 +484,9 @@ Not attempted. The required bottom line (3-image overfit) was prioritized first,
   <li>Basin coverage is imbalanced: with fresh random noises, roughly 10&ndash;12 of 16 one-step samples land on
   the same training image. Nothing in the unconditional objective demands balanced basins, and all three images are
   reliably covered, but a generator with equal 1/3 assignment probability would need explicit conditioning.</li>
-  <li>10-class Imagenette bonus not attempted (see 3.3).</li>
+  <li>The 10-class samples are impressionistic — coherent scene layouts and textures rather than crisp,
+  nameable objects. That meets the assignment's "recognizable structure" bar, but no held-out quality or FID is
+  claimed, and without class conditioning the sampled class mix is not controllable.</li>
   <li>Batch composition when cycling through more images than fit evenly into <code>--batch-size</code> is not
   perfectly balanced (uses ceiling-division tiling then truncation) — fine for small image counts like 3, would need
   revisiting for larger sets.</li>

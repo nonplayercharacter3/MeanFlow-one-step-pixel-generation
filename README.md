@@ -2,7 +2,7 @@
 
 A minimal PyTorch implementation of MeanFlow for one-step image generation in pixel space.
 
-This project ports the core MeanFlow training objective from the reference JAX implementation into a small GPU-compatible PyTorch training loop. The current implementation focuses on verifying the method through tiny overfitting experiments before scaling to a 10-class Imagenette subset.
+This project ports the core MeanFlow training objective from the reference JAX implementation into a small GPU-compatible PyTorch training loop. The method is first verified through tiny overfitting experiments (the assignment's required milestone), then trained on the full 10-class Imagenette subset (the bonus tier).
 
 ## Project Goal
 
@@ -24,6 +24,8 @@ The required milestone is to overfit three fixed training images and reproduce t
 
 **The required milestone is reached**: the 3-image overfit converges to mean nearest-image `sample_mse = 0.0094` (per image: 0.0021 / 0.0050 / 0.0053) in ~900 steps, and one-step samples from held-out noise are visually indistinguishable copies of the training images. See `report.html` for the full debugging journey.
 
+**The bonus tier is also reached**: trained unconditionally on the full Imagenette train split (9,469 images, 32×32), one-step samples show recognizable structure — coherent scene layouts, animal/vehicle-shaped subjects — in a single 20k-step run (~1.5 h on a Colab L4). See report section 3.3.
+
 Implemented:
 
 * image loading and normalization;
@@ -35,16 +37,18 @@ Implemented:
 * EMA weights for evaluation, adaptive LR (`ReduceLROnPlateau` on sample quality), gradient clipping;
 * assignment-free evaluation: samples are scored against their *nearest* training image, since MeanFlow's marginal flow chooses its own noise-to-image assignment;
 * `sample.py` for held-out-noise evaluation of a trained checkpoint;
+* dataset mode (`--data-dir`): a minimal PIL-based image-folder loader (`dataset.py`, no torchvision) for training on the full Imagenette subset, steered by an EMA-smoothed training loss;
 * analytical JVP test, gradient and numerical sanity checks, checkpoint and sample saving.
 
 ## Repository Structure
 
 ```text
 MeanFlow/
-├── train.py          # Training entry point
+├── train.py          # Training entry point (--images overfit mode / --data-dir dataset mode)
 ├── sample.py         # Held-out-noise evaluation of a trained checkpoint
 ├── model.py          # Mini U-Net with FiLM time conditioning
 ├── meanflow.py       # MeanFlow objective, JVP, and sampler
+├── dataset.py        # Minimal PIL-based image-folder loader for --data-dir mode
 ├── utils.py          # Image loading and output utilities
 ├── README.md
 ├── Experiments.md    # Chronological experiment log
@@ -57,14 +61,16 @@ MeanFlow/
 
 * Python 3.10 or newer
 * PyTorch 2.x
-* torchvision
+* NumPy
 * Pillow
 * matplotlib
+
+(No torchvision: the image-folder pipeline in `dataset.py` is plain PIL + `torch.utils.data`.)
 
 Install dependencies:
 
 ```bash
-pip install torch torchvision pillow matplotlib
+pip install -r requirements.txt
 ```
 
 For the final experiment, an NVIDIA GPU is recommended. The code can run on CPU for small debugging experiments, but training is substantially slower.
@@ -72,6 +78,13 @@ For the final experiment, an NVIDIA GPU is recommended. The code can run on CPU 
 ## Data
 
 The overfit experiments use fixed images from Imagenette (`data/overfit1/`, `data/overfit3/`).
+
+The 10-class run uses the full Imagenette train split (160px edition), which is not committed to the repo. Download and extract it with:
+
+```bash
+wget https://s3.amazonaws.com/fast-ai-imageclas/imagenette2-160.tgz -O data/imagenette2-160.tgz
+tar -xzf data/imagenette2-160.tgz -C data/
+```
 
 Each image is:
 
@@ -85,7 +98,7 @@ The full assignment target uses either Imagenette or another fixed 10-class Imag
 ## Run a Syntax Check
 
 ```bash
-python -m py_compile train.py sample.py model.py meanflow.py utils.py
+python -m py_compile train.py sample.py model.py meanflow.py dataset.py utils.py
 ```
 
 ## Run a Short Smoke Test
@@ -153,6 +166,36 @@ python train.py \
 `--images` accepts any number of paths; the batch is filled by cycling through them.
 
 Evaluation is assignment-free: MeanFlow's learned marginal flow chooses its own noise-to-image mapping, so pairing a fixed noise with a fixed image would report spurious errors. Instead, each of 8 fixed eval noises is scored against its *nearest* training image (`sample_mse`), and each image is scored by its best reproduction across the noises (the per-image `img0=...` numbers in the log and CSV). Outputs include `clean_grid.png`, `sample_best_grid.png` (samples sorted by nearest image), per-image `clean_{i}.png` / `sample_best_{i}.png` pairs, `loss_history.csv`, and `loss_curve.png`.
+
+## Run the 10-Class Imagenette Training (bonus tier)
+
+Trains unconditionally on all 9,469 Imagenette training images (~1.5 h on a Colab L4; `Run_Imagenette10_in_Colab.ipynb` wraps this with the dataset download, Drive saving, and disconnect recovery):
+
+```bash
+python train.py \
+  --data-dir data/imagenette2-160/train \
+  --steps 20000 \
+  --batch-size 64 \
+  --lr 3e-4 \
+  --lr-decay-steps 20000 \
+  --time-sampling logit_normal \
+  --equal-time-probability 0.5 \
+  --endpoint-probability 0.1 \
+  --loss-weight-power 1.0 \
+  --eval-every 100 \
+  --sample-every 1000 \
+  --checkpoint-every 2000 \
+  --num-eval-noises 16 \
+  --num-workers 4 \
+  --output-dir outputs/imagenette10
+```
+
+Notes for this mode:
+
+* Pass exactly one of `--images` / `--data-dir`.
+* There is no per-image reproduction metric with ~10k images; best-checkpoint selection and LR control run on an EMA-smoothed training loss, and progress is judged from the periodic `sample_step_*.png` grids (a `train_batch_grid.png` reference is saved for comparison).
+* With `--loss-weight-power 1.0` the visible loss saturates just below 1 by construction (each sample contributes `err/(err + 1e-3)`); a "flat" loss around 0.99 is expected while samples improve.
+* Batch 64 fits a 22 GB L4; batch 128 does not — the forward-mode JVP roughly doubles activation memory.
 
 ## Evaluate a Checkpoint on Held-Out Noise
 
@@ -257,7 +300,7 @@ Detailed experiment notes are stored in `Experiments.md`; the debugging narrativ
 * Unconditional only; basin coverage across the 3 images is imbalanced (most random noises map to one image, though all three are reliably produced).
 * CPU training is slow; the final recipe assumes a GPU.
 * A decreasing loss does not by itself prove successful one-step generation — hence the assignment-free `sample_mse` and `sample.py` held-out check.
-* The optional 10-class Imagenette extension was not attempted.
+* The 10-class samples are impressionistic (coherent scenes and textures, not crisp objects); no held-out quality or FID is claimed.
 
 ## References
 
